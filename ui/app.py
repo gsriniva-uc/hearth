@@ -5,12 +5,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ui/app.py
 Hearth — Family OS · Streamlit UI
 
-Tabs:
-  1. Calendar   — view upcoming events, NL add/query
-  2. Gmail Scan — scan inbox for school emails, review, confirm
-  3. Upload PDF — manual newsletter upload fallback
-
-Settings live in the sidebar expander — not a tab.
+Tabs:  📅 Calendar  |  📬 Gmail Scan  |  📄 Upload PDF
+Settings in sidebar expander (not a tab).
 """
 
 import streamlit as st
@@ -19,6 +15,11 @@ from datetime import date
 import hearth_config as cfg
 from agent.graph import run
 from agent.calendar_agent import init_db, _query_upcoming, _delete_event, _insert_event
+from agent.gmail_agent import (
+    is_credentials_configured,
+    is_authenticated,
+    scan_gmail_for_school_events,
+)
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -40,21 +41,31 @@ with st.sidebar:
     st.caption(cfg.get_family_summary())
     st.divider()
 
-    status_ok = cfg.is_configured()
-    if status_ok:
+    if cfg.is_configured():
         st.success("✅ Ready")
     else:
         st.error("⚠️ ANTHROPIC_API_KEY or CHILDREN not set")
 
-    # ── Quick stats ───────────────────────────────────────────────────────────
     upcoming = _query_upcoming(days_ahead=7)
     st.metric("Events this week", len(upcoming))
 
     st.divider()
 
+    # ── Gmail auth status ─────────────────────────────────────────────────────
+    st.markdown("**📬 Gmail**")
+    if not is_credentials_configured():
+        st.warning("credentials file missing")
+        st.caption("Add `data/google_credentials.json`")
+    elif is_authenticated():
+        st.success("Connected")
+    else:
+        st.info("Click 'Scan Gmail' to connect")
+
+    st.divider()
+
     # ── Manual nudge trigger ──────────────────────────────────────────────────
-    st.markdown("**🔔 Nudge scan**")
-    if st.button("Run now", help="Fire today's pending nudges"):
+    st.markdown("**🔔 Nudges**")
+    if st.button("Run scan now"):
         from scheduler.nudge_scheduler import run_nudge_scan
         with st.spinner("Scanning…"):
             result = run_nudge_scan()
@@ -89,38 +100,37 @@ tab_cal, tab_gmail, tab_pdf = st.tabs(["📅 Calendar", "📬 Gmail Scan", "📄
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_cal:
-
-    # ── Upcoming events ───────────────────────────────────────────────────────
     col_hd, col_days = st.columns([5, 2])
     with col_hd:
         st.subheader("Upcoming events")
     with col_days:
-        days = st.slider("Days ahead", 7, 90, 14, key="cal_days", label_visibility="collapsed")
+        days = st.slider("Days ahead", 7, 90, 14, key="cal_days",
+                         label_visibility="collapsed")
 
     events = _query_upcoming(days_ahead=days)
 
     if not events:
-        st.info(f"No events in the next {days} days. Add one below or scan Gmail.")
+        st.info(f"No events in the next {days} days. Scan Gmail or add one below.")
     else:
-        # Group by date
         from itertools import groupby
         for event_date, group in groupby(events, key=lambda e: e["event_date"]):
             day_label = date.fromisoformat(event_date).strftime("%A, %b %d")
             st.markdown(f"**{day_label}**")
             for ev in group:
-                label    = ev["event_type"].replace("_", " ").title()
-                time_str = f" · {ev['event_time']}" if ev.get("event_time") else ""
-                notes_str = f" — {ev['notes']}" if ev.get("notes") else ""
-                nudge_str = ""
-                if ev.get("nudge_sent_7d"):  nudge_str += " 7d✓"
-                if ev.get("nudge_sent_48h"): nudge_str += " 48h✓"
-                if ev.get("nudge_sent_day"): nudge_str += " day✓"
-
+                label     = ev["event_type"].replace("_", " ").title()
+                time_str  = f" · {ev['event_time']}" if ev.get("event_time") else ""
+                notes_str = f" — {ev['notes']}"      if ev.get("notes")      else ""
+                nudges    = "".join([
+                    " 7d✓"  if ev.get("nudge_sent_7d")  else "",
+                    " 48h✓" if ev.get("nudge_sent_48h") else "",
+                    " day✓" if ev.get("nudge_sent_day") else "",
+                ])
                 c1, c2 = st.columns([9, 1])
                 with c1:
                     st.markdown(
-                        f"&nbsp;&nbsp;&nbsp;**{ev['child_name']}** · {label}{time_str}{notes_str}"
-                        + (f" `{nudge_str.strip()}`" if nudge_str else "")
+                        f"&nbsp;&nbsp;&nbsp;**{ev['child_name']}** · {label}"
+                        f"{time_str}{notes_str}"
+                        + (f" `{nudges.strip()}`" if nudges.strip() else "")
                     )
                 with c2:
                     if st.button("🗑", key=f"del_{ev['id']}"):
@@ -129,8 +139,6 @@ with tab_cal:
             st.markdown("")
 
     st.divider()
-
-    # ── NL input ──────────────────────────────────────────────────────────────
     st.subheader("Add or ask")
     st.caption('e.g. "Add dress-down day for Avery on May 9" · "What\'s happening this week?"')
 
@@ -149,53 +157,76 @@ with tab_cal:
 
 with tab_gmail:
     st.subheader("Scan Gmail for school events")
+
+    # ── Setup instructions ────────────────────────────────────────────────────
+    if not is_credentials_configured():
+        st.error("Gmail not configured yet. Follow these steps:")
+        st.markdown("""
+**One-time Google setup (5 minutes):**
+
+1. Go to [console.cloud.google.com](https://console.cloud.google.com) → New project → name it `Hearth`
+2. **APIs & Services** → Enable APIs → search **Gmail API** → Enable
+3. **APIs & Services** → OAuth consent screen → External → fill in app name → Save
+4. **APIs & Services** → Credentials → Create Credentials → **OAuth 2.0 Client ID**
+   - Application type: **Desktop app** → Create
+5. Download the JSON → save it as **`data/google_credentials.json`** in your Hearth project
+6. Come back here and click **Scan Gmail** — your browser will open for a one-time login
+
+After that, Hearth remembers your token and never asks again.
+        """)
+        st.stop()
+
+    # ── Scan UI ───────────────────────────────────────────────────────────────
     st.caption(
         "Hearth searches your inbox for school newsletters, dismissal notices, "
-        "recital reminders, and more — then extracts events for you to review before saving."
+        "recital reminders, and more — then extracts events for you to review."
     )
 
-    col1, col2 = st.columns([2, 5])
-    with col1:
-        days_back = st.selectbox("Scan last", [7, 14, 30], index=1, key="gmail_days",
+    c1, c2 = st.columns([2, 5])
+    with c1:
+        days_back = st.selectbox("Scan last", [7, 14, 30], index=1,
                                   format_func=lambda d: f"{d} days")
-    with col2:
+    with c2:
         st.write("")
         st.write("")
         scan_btn = st.button("📬 Scan Gmail now", key="gmail_scan")
 
+    if not is_authenticated():
+        st.info("👆 First scan will open a browser window to connect your Google account. "
+                "This only happens once.")
+
     if scan_btn:
-        with st.spinner("Reading your inbox… this may take 20–30 seconds"):
-            from agent.gmail_agent import scan_gmail_for_school_events
+        with st.spinner("Connecting to Gmail and reading your inbox… (20–30 seconds)"):
             result = scan_gmail_for_school_events(days_back=days_back)
 
-        st.session_state["gmail_events"] = result.get("events", [])
-        st.session_state["gmail_summary"] = result.get("raw_summary", "")
+        if result.get("error"):
+            st.error(result["error"])
+        else:
+            st.session_state["gmail_events"] = result.get("events", [])
+            st.success(result.get("response", "Scan complete."))
 
-        if result.get("raw_summary"):
-            st.info(result["raw_summary"])
-
-    # ── Review extracted events ───────────────────────────────────────────────
+    # ── Review & confirm ──────────────────────────────────────────────────────
     if st.session_state.get("gmail_events"):
         extracted = st.session_state["gmail_events"]
         st.subheader(f"Review — {len(extracted)} event(s) found")
-        st.caption("Uncheck any you don't want to save.")
+        st.caption("Uncheck any you don't want to save, then click Save.")
 
         keep_flags = []
         for i, ev in enumerate(extracted):
-            label = ev.get("event_type", "other").replace("_", " ").title()
+            label  = ev.get("event_type", "other").replace("_", " ").title()
             source = ev.get("source_email", "")
             display = (
                 f"**{ev.get('event_date')}** · {ev.get('child_name', 'all')} · {label}"
                 + (f" at {ev['event_time']}" if ev.get("event_time") else "")
-                + (f" — {ev['notes']}" if ev.get("notes") else "")
-                + (f" *(from: {source})*" if source else "")
+                + (f" — {ev['notes']}"       if ev.get("notes")      else "")
+                + (f" *(from: {source})*"    if source                else "")
             )
             keep = st.checkbox(display, value=True, key=f"gmail_keep_{i}")
             keep_flags.append(keep)
 
         if st.button("✅ Save selected events", key="gmail_save"):
             to_save = [ev for ev, keep in zip(extracted, keep_flags) if keep]
-            saved = 0
+            saved   = 0
             for ev in to_save:
                 try:
                     _insert_event(
@@ -215,19 +246,16 @@ with tab_gmail:
     elif not scan_btn:
         st.markdown("""
 **What Hearth looks for:**
-- 👕 Dress-down / spirit days
-- 🏫 Early dismissals
-- 🎭 Recitals and performances
-- 🚌 Field trips
-- 📸 Picture days and special days
-- 🏥 Doctor appointment reminders
-- 📰 Any school newsletter with upcoming dates
 
-**Nudges you'll get once events are saved:**
-- Sunday weekly preview for the week ahead
-- 7-day heads-up for recitals and field trips
-- 48-hour reminder for any event
-- Morning-of reminder for dismissals and performances
+| | Event type | Nudges |
+|---|---|---|
+| 👕 | Dress-down / spirit days | 48h + day-of |
+| 🏫 | Early dismissals | 48h + day-of |
+| 🎭 | Recitals and performances | 7d (costume) + 48h + day-of |
+| 🚌 | Field trips | 7d (permission slip) + 48h (packed lunch) + day-of |
+| 📸 | Picture days and special days | 48h + day-of |
+| 🏥 | Doctor appointments | 48h + day-of |
+| 📅 | Weekly preview | Every Sunday morning |
         """)
 
 
@@ -237,7 +265,7 @@ with tab_gmail:
 
 with tab_pdf:
     st.subheader("Upload a school newsletter PDF")
-    st.caption("Use this if your school sends newsletters as PDF attachments rather than email body text.")
+    st.caption("Use this if your school sends newsletters as PDF attachments.")
 
     uploaded = st.file_uploader("Drop the PDF here", type=["pdf"])
 
@@ -245,9 +273,7 @@ with tab_pdf:
         if st.button("📋 Extract events", key="pdf_extract"):
             with st.spinner("Reading newsletter…"):
                 result = run(pdf_bytes=uploaded.read())
-
-            extracted = result.get("extracted_events", [])
-            st.session_state["pdf_events"] = extracted
+            st.session_state["pdf_events"] = result.get("extracted_events", [])
             st.info(result.get("response", ""))
 
     if st.session_state.get("pdf_events"):
@@ -256,11 +282,11 @@ with tab_pdf:
 
         keep_flags = []
         for i, ev in enumerate(extracted):
-            label = ev.get("event_type", "other").replace("_", " ").title()
+            label   = ev.get("event_type", "other").replace("_", " ").title()
             display = (
                 f"**{ev.get('event_date')}** · {ev.get('child_name', 'all')} · {label}"
                 + (f" at {ev['event_time']}" if ev.get("event_time") else "")
-                + (f" — {ev['notes']}" if ev.get("notes") else "")
+                + (f" — {ev['notes']}"       if ev.get("notes")      else "")
             )
             keep = st.checkbox(display, value=True, key=f"pdf_keep_{i}")
             keep_flags.append(keep)
