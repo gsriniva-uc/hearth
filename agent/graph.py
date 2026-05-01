@@ -16,31 +16,13 @@ Graph:
                 └── END (unknown)
 """
 
-from typing import TypedDict, Optional
 from langgraph.graph import StateGraph, END
 
-from agent.intake_agent  import intake_agent,  route_from_intake
+from agent.state import HearthState
+from agent.intake_agent import intake_agent, route_from_intake
 from agent.calendar_agent import calendar_agent
-from agent.event_parser  import event_parser
+from agent.event_parser import event_parser
 
-
-# ── State ─────────────────────────────────────────────────────────────────────
-
-class HearthState(TypedDict):
-    # Input
-    input_type:       str            # "manual" | "nl_command" | "pdf" | "query" | "unknown"
-    raw_text:         Optional[str]  # typed text from the user
-    pdf_bytes:        Optional[bytes]# raw bytes of an uploaded PDF
-
-    # Extracted / confirmed events
-    extracted_events: list           # set by event_parser
-    confirmed_events: list           # set by calendar_agent after CRUD
-
-    # Final reply to surface in the UI
-    response:         str
-
-
-# ── Build graph ───────────────────────────────────────────────────────────────
 
 def build_graph() -> StateGraph:
     g = StateGraph(HearthState)
@@ -61,7 +43,6 @@ def build_graph() -> StateGraph:
         },
     )
 
-    # After PDF parsing always flows into calendar_agent for confirmation + CRUD
     g.add_edge("event_parser",   "calendar_agent")
     g.add_edge("calendar_agent", END)
 
@@ -71,15 +52,9 @@ def build_graph() -> StateGraph:
 hearth_graph = build_graph()
 
 
-# ── Convenience runner ────────────────────────────────────────────────────────
-
 def run(raw_text: str = None, pdf_bytes: bytes = None) -> HearthState:
     """
     Entry point for the Streamlit UI and FastAPI endpoints.
-
-    Args:
-        raw_text:  typed user command / question
-        pdf_bytes: raw bytes of an uploaded school newsletter PDF
     """
     initial: HearthState = {
         "input_type":       "",
