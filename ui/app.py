@@ -13,6 +13,11 @@ Adapted from Alterus ui/app.py — same Streamlit patterns, new domain.
 
 import sqlite3
 from datetime import date, timedelta
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import streamlit as st
+import hearth_config as cfg
 
 import streamlit as st
 
