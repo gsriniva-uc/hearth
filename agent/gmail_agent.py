@@ -36,10 +36,13 @@ CREDENTIALS_FILE   = os.path.join(cfg.DATA_DIR, "google_credentials.json")
 TOKEN_FILE         = os.path.join(cfg.DATA_DIR, "google_token.json")
 
 SCHOOL_QUERY = (
-    "subject:(dismissal OR recital OR \"dress down\" OR \"field trip\" OR "
+    "(subject:(dismissal OR recital OR \"dress down\" OR \"field trip\" OR "
     "\"picture day\" OR \"spirit day\" OR newsletter OR \"school event\" OR "
-    "\"early release\" OR \"school holiday\" OR \"parent teacher\" OR "
-    "\"doctor appointment\" OR \"upcoming events\" OR performance OR fundraiser)"
+    "\"early release\" OR \"school holiday\" OR \"no school\" OR \"day off\" OR "
+    "\"schools closed\" OR \"school closed\" OR \"no classes\" OR \"holiday break\" OR "
+    "\"parent teacher\" OR \"upcoming events\" OR performance OR fundraiser OR reminder) "
+    "OR (\"no school\" OR \"school holiday\" OR \"early dismissal\" OR \"dress down\" "
+    "OR \"field trip\" OR \"early release\" OR \"schools closed\"))"
 )
 
 EVENT_TYPES = [
@@ -108,7 +111,7 @@ def _fetch_recent_school_emails(service, days_back: int = 14) -> list[dict]:
     after_date = (date.today() - timedelta(days=days_back)).strftime("%Y/%m/%d")
     query      = f"{SCHOOL_QUERY} after:{after_date}"
 
-    result   = service.users().messages().list(userId="me", q=query, maxResults=20).execute()
+    result   = service.users().messages().list(userId="me", q=query, maxResults=50).execute()
     messages = result.get("messages", [])
 
     emails = []
@@ -181,7 +184,9 @@ Valid event_type values: {", ".join(EVENT_TYPES)}.
 
 Below are {len(emails)} school-related emails from the past few days.
 Extract every upcoming school event, special day, dismissal, recital, field trip,
-doctor appointment, or other family-relevant date from these emails.
+doctor appointment, no-school day, school holiday, or other family-relevant date from these emails.
+Pay special attention to: days when school is closed, no-school notices, holiday breaks,
+teacher workdays, and any day requiring different childcare arrangements.
 
 {email_digest}
 
