@@ -1,182 +1,212 @@
 """
-agent/calendar_agent.py
+agent/calendar_agent.py — Multi-user version
 
-Owns the SQLite events store. Handles CRUD operations driven by LLM-parsed intent.
+All queries scoped by user_id.
+Schema includes user_id column (added via db_migrate.py).
 """
-
-import json
-import sqlite3
-from datetime import date
-
+import json, sqlite3, os
+from datetime import date, timedelta
 import anthropic
-
 import hearth_config as cfg
 from agent.state import HearthState
 
-
 EVENT_TYPES = [
-    "dress_down_day", "early_dismissal", "recital", "movie_night",
-    "field_trip", "special_day", "doctor_appointment", "sports_game",
-    "school_holiday", "other",
+    "dress_down_day","early_dismissal","recital","movie_night","field_trip",
+    "special_day","doctor_appointment","sports_game","school_holiday","other",
 ]
-
 _client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
 
+# ── DB ─────────────────────────────────────────────────────────────────────────
 
-def _get_conn() -> sqlite3.Connection:
-    import os
+def _conn():
     os.makedirs(cfg.DATA_DIR, exist_ok=True)
-    conn = sqlite3.connect(cfg.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
+    c = sqlite3.connect(cfg.DB_PATH)
+    c.row_factory = sqlite3.Row
+    return c
 
 def init_db():
-    with _get_conn() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                child_name     TEXT    NOT NULL,
-                event_type     TEXT    NOT NULL,
-                event_date     TEXT    NOT NULL,
-                event_time     TEXT,
-                notes          TEXT,
-                nudge_sent_7d  INTEGER DEFAULT 0,
-                nudge_sent_48h INTEGER DEFAULT 0,
-                nudge_sent_day INTEGER DEFAULT 0,
-                created_at     TEXT    DEFAULT (datetime('now'))
-            )
-        """)
-        conn.commit()
+    with _conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS events (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id          TEXT    NOT NULL DEFAULT 'default',
+            child_name       TEXT    NOT NULL,
+            event_type       TEXT    NOT NULL,
+            event_date       TEXT    NOT NULL,
+            event_time       TEXT,
+            notes            TEXT,
+            nudge_sent_7d    INTEGER DEFAULT 0,
+            nudge_sent_48h   INTEGER DEFAULT 0,
+            nudge_sent_day   INTEGER DEFAULT 0,
+            nudge_sent_1h    INTEGER DEFAULT 0,
+            gcal_event_id    TEXT,
+            outlook_event_id TEXT,
+            created_at       TEXT    DEFAULT (datetime('now'))
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id)")
+        c.commit()
 
+# ── CRUD (all scoped to user_id) ───────────────────────────────────────────────
 
-def _insert_event(child_name, event_type, event_date, event_time=None, notes=None) -> int:
-    with _get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO events (child_name, event_type, event_date, event_time, notes) VALUES (?,?,?,?,?)",
-            (child_name, event_type, event_date, event_time, notes),
-        )
-        conn.commit()
+def _insert_event(user_id, child_name, event_type, event_date,
+                  event_time=None, notes=None) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO events(user_id,child_name,event_type,event_date,event_time,notes)"
+            " VALUES(?,?,?,?,?,?)",
+            (user_id, child_name, event_type, event_date, event_time, notes))
+        c.commit()
         return cur.lastrowid
 
-
-def _query_upcoming(days_ahead: int = 14) -> list:
-    from datetime import timedelta
-    today = date.today().isoformat()
-    cutoff = (date.today() + timedelta(days=days_ahead)).isoformat()
-    with _get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM events WHERE event_date BETWEEN ? AND ? ORDER BY event_date",
-            (today, cutoff),
-        ).fetchall()
+def _query_upcoming(user_id: str, days_ahead=14) -> list:
+    today  = date.today().isoformat()
+    cutoff = (date.today()+timedelta(days=days_ahead)).isoformat()
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM events WHERE user_id=? AND event_date BETWEEN ? AND ?"
+            " ORDER BY event_date",
+            (user_id, today, cutoff)).fetchall()
     return [dict(r) for r in rows]
 
+def _query_today(user_id: str) -> list:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM events WHERE user_id=? AND event_date=? ORDER BY event_time",
+            (user_id, date.today().isoformat())).fetchall()
+    return [dict(r) for r in rows]
 
-def _delete_event(event_id: int) -> bool:
-    with _get_conn() as conn:
-        cur = conn.execute("DELETE FROM events WHERE id=?", (event_id,))
-        conn.commit()
+def _delete_event(user_id: str, event_id: int) -> bool:
+    with _conn() as c:
+        cur = c.execute("DELETE FROM events WHERE id=? AND user_id=?", (event_id, user_id))
+        c.commit()
         return cur.rowcount > 0
 
+def _event_exists(user_id: str, child_name: str, event_type: str, event_date: str) -> bool:
+    if not os.path.exists(cfg.DB_PATH): return False
+    with _conn() as c:
+        row = c.execute(
+            "SELECT id FROM events WHERE user_id=? AND child_name=?"
+            " AND event_type=? AND event_date=?",
+            (user_id, child_name, event_type, event_date)).fetchone()
+    return row is not None
 
-def _parse_intent(text: str, input_type: str, extracted_events: list) -> dict:
-    today_str = date.today().strftime("%A, %B %d, %Y")
-    children_str = ", ".join(cfg.CHILDREN) if cfg.CHILDREN else "the children"
+# ── Calendar sync ──────────────────────────────────────────────────────────────
 
-    if extracted_events:
-        return {"action": "add", "events": extracted_events, "reply": ""}
-
-    prompt = f"""You are the calendar agent for a family app called Hearth.
-Today is {today_str}.
-Children in this family: {children_str}.
-Valid event_type values: {", ".join(EVENT_TYPES)}.
-
-The user said: "{text}"
-Input classification: {input_type}
-
-Return a JSON object:
-{{
-  "action": "add" | "delete" | "query" | "update",
-  "events": [
-    {{
-      "child_name": "<name or 'all'>",
-      "event_type": "<one of the valid types>",
-      "event_date": "<YYYY-MM-DD>",
-      "event_time": "<HH:MM or null>",
-      "notes": "<any extra context or null>"
-    }}
-  ],
-  "delete_id": null,
-  "query_window_days": 7,
-  "reply": ""
-}}
-
-Resolve relative dates from today. Return ONLY the JSON."""
-
-    resp = _client.messages.create(
-        model=cfg.CLAUDE_MODEL,
-        max_tokens=512,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = resp.content[0].text.strip()
+def _sync_to_gcal(user_id, event_id, child_name, event_type,
+                  event_date, event_time=None, notes=None):
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {"action": "query", "events": [], "query_window_days": 7, "reply": ""}
+        from agent.auth import get_credentials
+        from googleapiclient.discovery import build
+        creds = get_credentials(user_id)
+        if not creds: return
+        service = build("calendar","v3",credentials=creds)
+        label   = event_type.replace("_"," ").title()
+        start   = ({"dateTime":f"{event_date}T{event_time}:00","timeZone":"America/New_York"}
+                   if event_time else {"date":event_date})
+        end     = start
+        body    = {"summary":f"{child_name}: {label}","description":notes or "",
+                   "start":start,"end":end,
+                   "reminders":{"useDefault":False,
+                       "overrides":[{"method":"popup","minutes":1440},
+                                    {"method":"email","minutes":1440}]}}
+        ev = service.events().insert(calendarId="primary",body=body).execute()
+        with _conn() as c:
+            c.execute("UPDATE events SET gcal_event_id=? WHERE id=? AND user_id=?",
+                      (ev["id"], event_id, user_id))
+            c.commit()
+    except Exception as e:
+        print(f"[gcal] {e}")
 
+def _sync_to_outlook(user_id, event_id, child_name, event_type,
+                     event_date, event_time=None, notes=None):
+    try:
+        import requests as req
+        if not os.path.exists(cfg.OUTLOOK_TOKEN_FILE): return
+        with open(cfg.OUTLOOK_TOKEN_FILE) as f: td = json.load(f)
+        token = td.get("access_token","")
+        if not token: return
+        label    = event_type.replace("_"," ").title()
+        start_dt = f"{event_date}T{event_time}:00" if event_time else f"{event_date}T00:00:00"
+        end_dt   = f"{event_date}T{event_time}:00" if event_time else f"{event_date}T23:59:00"
+        body = {"subject":f"{child_name}: {label}",
+                "body":{"contentType":"Text","content":notes or ""},
+                "start":{"dateTime":start_dt,"timeZone":"Eastern Standard Time"},
+                "end":  {"dateTime":end_dt,  "timeZone":"Eastern Standard Time"},
+                "isAllDay": not event_time}
+        r = req.post("https://graph.microsoft.com/v1.0/me/events", json=body,
+                     headers={"Authorization":f"Bearer {token}",
+                              "Content-Type":"application/json"}, timeout=15)
+        if r.status_code == 201:
+            with _conn() as c:
+                c.execute("UPDATE events SET outlook_event_id=? WHERE id=? AND user_id=?",
+                          (r.json().get("id",""), event_id, user_id))
+                c.commit()
+    except Exception as e:
+        print(f"[outlook] {e}")
+
+# ── LLM intent ─────────────────────────────────────────────────────────────────
+
+def _parse_intent(text, input_type, extracted_events) -> dict:
+    if extracted_events:
+        return {"action":"add","events":extracted_events,"query_window_days":7}
+    today_str    = date.today().strftime("%A, %B %d, %Y")
+    children_str = ", ".join(cfg.CHILDREN) or "the children"
+    prompt = f"""Hearth calendar. Today: {today_str}. Children: {children_str}.
+Valid event_type: {", ".join(EVENT_TYPES)}.
+User: "{text}" (type: {input_type})
+Return JSON: {{"action":"add"|"delete"|"query","events":[{{"child_name":"...","event_type":"...","event_date":"YYYY-MM-DD","event_time":"HH:MM|null","notes":"...|null"}}],"delete_id":null,"query_window_days":7}}
+ONLY JSON."""
+    resp = _client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=512,
+        messages=[{"role":"user","content":prompt}])
+    try: return json.loads(resp.content[0].text.strip())
+    except: return {"action":"query","events":[],"query_window_days":7}
+
+# ── Main node ───────────────────────────────────────────────────────────────────
 
 def calendar_agent(state: HearthState) -> HearthState:
     init_db()
-
-    intent = _parse_intent(
-        text=state.get("raw_text") or "",
-        input_type=state.get("input_type", "query"),
-        extracted_events=state.get("extracted_events", []),
-    )
-
-    action = intent.get("action", "query")
-    confirmed = []
-    reply_lines = []
+    user_id = state.get("user_id") or "default"
+    intent  = _parse_intent(state.get("raw_text") or "",
+                            state.get("input_type","query"),
+                            state.get("extracted_events",[]))
+    action, confirmed, lines = intent.get("action","query"), [], []
 
     if action == "add":
-        for ev in intent.get("events", []):
+        for ev in intent.get("events",[]):
             try:
-                eid = _insert_event(
-                    child_name=ev.get("child_name", "all"),
-                    event_type=ev.get("event_type", "other"),
-                    event_date=ev["event_date"],
-                    event_time=ev.get("event_time"),
-                    notes=ev.get("notes"),
-                )
-                confirmed.append({**ev, "id": eid})
-                label = ev.get("event_type", "event").replace("_", " ").title()
-                reply_lines.append(
-                    f"✅ Added **{label}** for {ev.get('child_name', 'all')} on {ev['event_date']}"
-                    + (f" at {ev['event_time']}" if ev.get("event_time") else "")
-                )
+                eid = _insert_event(user_id, ev.get("child_name","all"),
+                                    ev.get("event_type","other"), ev["event_date"],
+                                    ev.get("event_time"), ev.get("notes"))
+                confirmed.append({**ev,"id":eid})
+                label = ev.get("event_type","event").replace("_"," ").title()
+                lines.append(f"✅ **{label}** for {ev.get('child_name','all')} on {ev['event_date']}"
+                             + (f" at {ev['event_time']}" if ev.get("event_time") else ""))
+                _sync_to_gcal(user_id, eid, ev.get("child_name","all"),
+                              ev.get("event_type","other"), ev["event_date"],
+                              ev.get("event_time"), ev.get("notes"))
+                _sync_to_outlook(user_id, eid, ev.get("child_name","all"),
+                                 ev.get("event_type","other"), ev["event_date"],
+                                 ev.get("event_time"), ev.get("notes"))
             except Exception as e:
-                reply_lines.append(f"⚠️ Could not add event: {e}")
+                lines.append(f"⚠️ Could not add: {e}")
 
     elif action == "delete":
         did = intent.get("delete_id")
-        if did and _delete_event(int(did)):
-            reply_lines.append(f"🗑️ Event #{did} deleted.")
-        else:
-            reply_lines.append("⚠️ Couldn't find that event to delete.")
+        lines.append(f"🗑️ Deleted." if did and _delete_event(user_id, int(did))
+                     else "⚠️ Event not found.")
 
     elif action == "query":
-        days = intent.get("query_window_days", 7)
-        rows = _query_upcoming(days_ahead=days)
+        days = intent.get("query_window_days",7)
+        rows = _query_upcoming(user_id, days_ahead=days)
         if not rows:
-            reply_lines.append(f"📅 No events in the next {days} days.")
+            lines.append(f"📅 No events in the next {days} days.")
         else:
-            reply_lines.append(f"📅 **Upcoming events (next {days} days):**\n")
+            lines.append(f"📅 **Next {days} days:**\n")
             for r in rows:
-                label = r["event_type"].replace("_", " ").title()
+                label    = r["event_type"].replace("_"," ").title()
                 time_str = f" at {r['event_time']}" if r.get("event_time") else ""
-                reply_lines.append(
-                    f"• [{r['id']}] **{r['child_name']}** — {label} on {r['event_date']}{time_str}"
-                )
+                lines.append(f"• **{r['child_name']}** — {label} on {r['event_date']}{time_str}")
 
-    reply = "\n".join(reply_lines) if reply_lines else "Done."
-    return {**state, "confirmed_events": confirmed, "response": reply}
+    return {**state, "confirmed_events":confirmed,
+            "response":"\n".join(lines) or "Done.",
+            "notify":bool(confirmed),
+            "notify_message":"\n".join(lines) if confirmed else None}

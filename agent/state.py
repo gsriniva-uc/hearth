@@ -1,17 +1,27 @@
-"""
-agent/state.py
-
-Shared state definition for the Hearth LangGraph graph.
-Kept in its own module to avoid circular imports.
-"""
-
-from typing import TypedDict, Optional
-
+"""agent/state.py — Shared LangGraph state"""
+from typing import TypedDict, Optional, Literal
 
 class HearthState(TypedDict):
-    input_type:       str            # "manual" | "nl_command" | "pdf" | "query" | "unknown"
-    raw_text:         Optional[str]  # typed text from the user
-    pdf_bytes:        Optional[bytes]# raw bytes of an uploaded PDF
-    extracted_events: list           # set by event_parser
-    confirmed_events: list           # set by calendar_agent after CRUD
-    response:         str            # final reply to surface in the UI
+    # Input
+    input_type:  str                          # manual | nl_command | pdf | query | unknown
+    raw_text:    Optional[str]
+    pdf_bytes:   Optional[bytes]
+    user_id:     Optional[str]                # for multi-user (future)
+
+    # Routing
+    intent:      Optional[str]                # add_event | query | briefing | nudge | profile
+
+    # Events
+    extracted_events: list
+    confirmed_events: list
+
+    # Briefing
+    briefing_text: Optional[str]
+
+    # Profile
+    target_child: Optional[str]
+
+    # Output
+    response:    str
+    notify:      bool                         # should notification_agent fire?
+    notify_message: Optional[str]             # message to deliver

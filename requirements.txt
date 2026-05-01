@@ -1,37 +1,39 @@
-# ── Core ──────────────────────────────────────────────────────────────────────
+# Core
 streamlit==1.32.0
 python-dotenv==1.0.1
 
-# ── AI / LLM ──────────────────────────────────────────────────────────────────
+# LLM + agents
 anthropic>=0.40.0
 langchain==0.1.12
 langgraph==0.0.37
 langsmith==0.1.17
 
-# ── Vector memory ─────────────────────────────────────────────────────────────
-chromadb==0.4.24
-
-# ── API server ────────────────────────────────────────────────────────────────
-fastapi==0.110.0
-uvicorn==0.27.1
-python-multipart==0.0.9
-
-# ── Scheduler ─────────────────────────────────────────────────────────────────
-apscheduler==3.10.4
-
-# ── PDF parsing ───────────────────────────────────────────────────────────────
-PyPDF2==3.0.1
-
-# ── Date parsing ─────────────────────────────────────────────────────────────
-dateparser==1.2.0
-
-# ── Google OAuth + Gmail API ──────────────────────────────────────────────────
+# Google (Gmail + Calendar)
 google-auth==2.29.0
 google-auth-oauthlib==1.2.0
 google-auth-httplib2==0.2.0
 google-api-python-client==2.125.0
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
+# Microsoft (Outlook + Calendar)
+msal==1.28.0
 requests==2.31.0
+
+# Twilio (SMS + WhatsApp)
+twilio==9.0.4
+
+# PDF parsing
+PyPDF2==3.0.1
+
+# Scheduler + API
+apscheduler==3.10.4
+fastapi==0.110.0
+uvicorn==0.27.1
+python-multipart==0.0.9
+
+# Vector memory
+chromadb==0.4.24
+
+# Utilities
 pydantic==2.6.4
+dateparser==1.2.0
 httpx
