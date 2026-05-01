@@ -2,23 +2,15 @@
 agent/gmail_agent.py
 
 Scans Gmail for school-related emails using Google OAuth 2.0 + Gmail REST API.
-
-Setup (one-time per user):
-  1. Go to console.cloud.google.com → New project → "Hearth"
-  2. Enable Gmail API
-  3. OAuth consent screen → External → add your email as test user
-  4. Credentials → OAuth 2.0 Client ID → Desktop app → download JSON
-  5. Save as data/google_credentials.json
-  6. Run the app — first scan triggers browser OAuth flow → token saved to data/google_token.json
-  7. All future scans use the saved token (auto-refreshed)
+Runs automatically on app startup and on a daily schedule.
+Deduplicates events before inserting — safe to run multiple times.
 """
 
 import base64
 import json
 import os
 import re
-from datetime import date, timedelta, timezone, datetime
-from email import message_from_bytes
+from datetime import date, timedelta
 
 import anthropic
 from google.auth.transport.requests import Request
@@ -31,9 +23,9 @@ import hearth_config as cfg
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-SCOPES             = ["https://www.googleapis.com/auth/gmail.readonly"]
-CREDENTIALS_FILE   = os.path.join(cfg.DATA_DIR, "google_credentials.json")
-TOKEN_FILE         = os.path.join(cfg.DATA_DIR, "google_token.json")
+SCOPES           = ["https://www.googleapis.com/auth/gmail.readonly"]
+CREDENTIALS_FILE = os.path.join(cfg.DATA_DIR, "google_credentials.json")
+TOKEN_FILE       = os.path.join(cfg.DATA_DIR, "google_token.json")
 
 SCHOOL_QUERY = (
     "(subject:(dismissal OR recital OR \"dress down\" OR \"field trip\" OR "
@@ -55,11 +47,6 @@ EVENT_TYPES = [
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 def get_gmail_service():
-    """
-    Returns an authenticated Gmail API service.
-    First call opens a browser for OAuth consent.
-    Subsequent calls use the saved token (auto-refreshed).
-    """
     os.makedirs(cfg.DATA_DIR, exist_ok=True)
     creds = None
 
@@ -70,19 +57,15 @@ def get_gmail_service():
             "and save it as data/google_credentials.json"
         )
 
-    # Load saved token
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
 
-    # Refresh or re-authenticate
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
-
-        # Save token for next time
         with open(TOKEN_FILE, "w") as f:
             f.write(creds.to_json())
 
@@ -90,7 +73,6 @@ def get_gmail_service():
 
 
 def is_authenticated() -> bool:
-    """Check if a valid token already exists — no browser needed."""
     if not os.path.exists(TOKEN_FILE):
         return False
     try:
@@ -104,10 +86,24 @@ def is_credentials_configured() -> bool:
     return os.path.exists(CREDENTIALS_FILE)
 
 
+# ── Deduplication ─────────────────────────────────────────────────────────────
+
+def _event_exists(child_name: str, event_type: str, event_date: str) -> bool:
+    """Returns True if an identical event is already in the DB."""
+    import sqlite3
+    if not os.path.exists(cfg.DB_PATH):
+        return False
+    with sqlite3.connect(cfg.DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT id FROM events WHERE child_name=? AND event_type=? AND event_date=?",
+            (child_name, event_type, event_date),
+        ).fetchone()
+    return row is not None
+
+
 # ── Gmail fetch ────────────────────────────────────────────────────────────────
 
-def _fetch_recent_school_emails(service, days_back: int = 14) -> list[dict]:
-    """Search Gmail and return a list of {subject, body, date} dicts."""
+def _fetch_recent_school_emails(service, days_back: int = 14) -> list:
     after_date = (date.today() - timedelta(days=days_back)).strftime("%Y/%m/%d")
     query      = f"{SCHOOL_QUERY} after:{after_date}"
 
@@ -122,21 +118,13 @@ def _fetch_recent_school_emails(service, days_back: int = 14) -> list[dict]:
             ).execute()
 
             subject = ""
-            msg_date = ""
             for header in full["payload"].get("headers", []):
                 if header["name"] == "Subject":
                     subject = header["value"]
-                if header["name"] == "Date":
-                    msg_date = header["value"]
 
             body = _extract_body(full["payload"])
-
             if body:
-                emails.append({
-                    "subject": subject,
-                    "date":    msg_date,
-                    "body":    body[:3000],   # cap per email to stay within token budget
-                })
+                emails.append({"subject": subject, "body": body[:3000]})
         except Exception:
             continue
 
@@ -144,7 +132,6 @@ def _fetch_recent_school_emails(service, days_back: int = 14) -> list[dict]:
 
 
 def _extract_body(payload: dict) -> str:
-    """Recursively extract plain text body from Gmail message payload."""
     mime_type = payload.get("mimeType", "")
     body_data = payload.get("body", {}).get("data", "")
 
@@ -154,8 +141,7 @@ def _extract_body(payload: dict) -> str:
         except Exception:
             return ""
 
-    parts = payload.get("parts", [])
-    for part in parts:
+    for part in payload.get("parts", []):
         text = _extract_body(part)
         if text:
             return text
@@ -163,50 +149,47 @@ def _extract_body(payload: dict) -> str:
     return ""
 
 
-# ── LLM event extraction ──────────────────────────────────────────────────────
+# ── LLM extraction ────────────────────────────────────────────────────────────
 
-def _extract_events_from_emails(emails: list[dict]) -> list[dict]:
-    """Send email bodies to Claude for structured event extraction."""
+def _extract_events_from_emails(emails: list) -> list:
     if not emails:
         return []
 
     today_str    = date.today().strftime("%A, %B %d, %Y")
     children_str = ", ".join(cfg.CHILDREN) if cfg.CHILDREN else "the children"
 
-    # Build email digest for Claude
     email_digest = ""
     for i, em in enumerate(emails, 1):
-        email_digest += f"\n--- Email {i}: {em['subject']} ({em['date']}) ---\n{em['body']}\n"
+        email_digest += f"\n--- Email {i}: {em['subject']} ---\n{em['body']}\n"
 
     prompt = f"""You are Hearth, a family calendar assistant. Today is {today_str}.
 Children in this family: {children_str}.
 Valid event_type values: {", ".join(EVENT_TYPES)}.
 
-Below are {len(emails)} school-related emails from the past few days.
+Below are {len(emails)} school-related emails.
 Extract every upcoming school event, special day, dismissal, recital, field trip,
-doctor appointment, no-school day, school holiday, or other family-relevant date from these emails.
+doctor appointment, no-school day, school holiday, or other family-relevant date.
 Pay special attention to: days when school is closed, no-school notices, holiday breaks,
 teacher workdays, and any day requiring different childcare arrangements.
 
 {email_digest}
 
-For each event, return a JSON object:
+For each event return a JSON object:
 {{
-  "child_name": "<child name from family list, or 'all' if it applies to everyone>",
-  "event_type": "<one of the valid types>",
-  "event_date": "<YYYY-MM-DD — resolve all relative and partial dates from today>",
-  "event_time": "<HH:MM 24h format, or null>",
-  "notes":      "<brief plain-English description, or null>",
-  "source_email": "<subject line of the email this came from>"
+  "child_name":   "<child name from family list, or 'all'>",
+  "event_type":   "<one of the valid types>",
+  "event_date":   "<YYYY-MM-DD>",
+  "event_time":   "<HH:MM 24h or null>",
+  "notes":        "<brief description or null>",
+  "source_email": "<subject line>"
 }}
 
 Rules:
 - Only extract UPCOMING events (on or after today).
-- Ignore past dates, page footers, sent dates, and contact info.
-- If a date is ambiguous (e.g. "the 15th" with no month), use the next upcoming occurrence.
-- If the same event appears in multiple emails, include it only once.
+- Ignore past dates, page footers, sent dates, contact info.
+- If same event appears in multiple emails, include it only once.
 
-Return ONLY a JSON array of event objects. No prose, no markdown fences."""
+Return ONLY a JSON array. No prose, no markdown fences."""
 
     client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
     resp   = client.messages.create(
@@ -216,8 +199,6 @@ Return ONLY a JSON array of event objects. No prose, no markdown fences."""
     )
 
     raw = resp.content[0].text.strip()
-
-    # Strip markdown fences if Claude added them
     raw = re.sub(r"^```json\s*", "", raw)
     raw = re.sub(r"\s*```$",     "", raw)
 
@@ -228,19 +209,77 @@ Return ONLY a JSON array of event objects. No prose, no markdown fences."""
         return []
 
 
+# ── Insert with dedup ─────────────────────────────────────────────────────────
+
+def _insert_if_new(ev: dict) -> bool:
+    """Insert event only if it doesn't already exist. Returns True if inserted."""
+    from agent.calendar_agent import _insert_event
+
+    child     = ev.get("child_name", "all")
+    etype     = ev.get("event_type", "other")
+    edate     = ev.get("event_date", "")
+
+    if not edate:
+        return False
+    if _event_exists(child, etype, edate):
+        return False
+
+    try:
+        _insert_event(
+            child_name=child,
+            event_type=etype,
+            event_date=edate,
+            event_time=ev.get("event_time"),
+            notes=ev.get("notes"),
+        )
+        return True
+    except Exception:
+        return False
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
+
+def auto_scan_and_save(days_back: int = 14) -> dict:
+    """
+    Scans Gmail, extracts events, deduplicates, and saves directly to DB.
+    No user review step — called automatically on app startup and daily cron.
+
+    Returns: {new: int, skipped: int, emails_scanned: int, error: str|None}
+    """
+    try:
+        service = get_gmail_service()
+        emails  = _fetch_recent_school_emails(service, days_back=days_back)
+
+        if not emails:
+            return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
+
+        events  = _extract_events_from_emails(emails)
+        new, skipped = 0, 0
+
+        for ev in events:
+            if _insert_if_new(ev):
+                new += 1
+            else:
+                skipped += 1
+
+        return {
+            "new":            new,
+            "skipped":        skipped,
+            "emails_scanned": len(emails),
+            "error":          None,
+        }
+
+    except FileNotFoundError as e:
+        return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": str(e)}
+    except Exception as e:
+        return {"new": 0, "skipped": 0, "emails_scanned": 0,
+                "error": f"Gmail scan failed: {e}"}
+
 
 def scan_gmail_for_school_events(days_back: int = 14) -> dict:
     """
-    Main entry point called by the Streamlit UI.
-
-    Returns:
-      {
-        "events":         list of structured event dicts,
-        "emails_scanned": int,
-        "response":       human-readable summary string,
-        "error":          str or None
-      }
+    Manual scan with review — returns events without saving.
+    Used by the Gmail tab for user-controlled review flow.
     """
     try:
         service = get_gmail_service()
@@ -248,25 +287,18 @@ def scan_gmail_for_school_events(days_back: int = 14) -> dict:
 
         if not emails:
             return {
-                "events":         [],
-                "emails_scanned": 0,
-                "response":       f"No school-related emails found in the last {days_back} days.",
-                "error":          None,
+                "events": [], "emails_scanned": 0,
+                "response": f"No school-related emails found in the last {days_back} days.",
+                "error": None,
             }
 
-        events = _extract_events_from_emails(emails)
-
+        events  = _extract_events_from_emails(emails)
         summary = (
-            f"Scanned {len(emails)} school-related email(s) from the last {days_back} days. "
-            f"Found {len(events)} upcoming event(s)."
+            f"Scanned {len(emails)} email(s). Found {len(events)} upcoming event(s)."
         )
 
-        return {
-            "events":         events,
-            "emails_scanned": len(emails),
-            "response":       summary,
-            "error":          None,
-        }
+        return {"events": events, "emails_scanned": len(emails),
+                "response": summary, "error": None}
 
     except FileNotFoundError as e:
         return {"events": [], "emails_scanned": 0, "response": "", "error": str(e)}

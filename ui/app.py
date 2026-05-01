@@ -4,18 +4,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import streamlit as st
 from datetime import date
 
-import hearth_config as cfg
-from agent.graph import run
-from agent.calendar_agent import init_db, _query_upcoming, _delete_event, _insert_event
-from agent.gmail_agent import (
-    is_credentials_configured,
-    is_authenticated,
-    scan_gmail_for_school_events,
-)
-
-
-# ── Page config ───────────────────────────────────────────────────────────────
-
 st.set_page_config(
     page_title="Hearth 🏠",
     page_icon="🏠",
@@ -23,7 +11,31 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+import hearth_config as cfg
+from agent.graph import run
+from agent.calendar_agent import init_db, _query_upcoming, _delete_event, _insert_event
+from agent.gmail_agent import (
+    is_credentials_configured,
+    is_authenticated,
+    auto_scan_and_save,
+    scan_gmail_for_school_events,
+)
+
 init_db()
+
+
+# ── Auto Gmail scan on startup ────────────────────────────────────────────────
+# Runs once per session — silently adds new events, skips duplicates
+
+if "startup_scan_done" not in st.session_state:
+    st.session_state["startup_scan_done"] = True
+    if is_credentials_configured() and is_authenticated():
+        with st.spinner("📬 Checking Gmail for new school events…"):
+            result = auto_scan_and_save(days_back=14)
+        if result.get("new", 0) > 0:
+            st.toast(f"📅 {result['new']} new school event(s) added from Gmail", icon="📬")
+        elif result.get("error"):
+            st.toast(f"Gmail scan: {result['error']}", icon="⚠️")
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -43,19 +55,26 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Gmail auth status ─────────────────────────────────────────────────────
+    # ── Gmail status ──────────────────────────────────────────────────────────
     st.markdown("**📬 Gmail**")
     if not is_credentials_configured():
-        st.warning("credentials file missing")
-        st.caption("Add `data/google_credentials.json`")
+        st.warning("Not configured")
+        st.caption("See Gmail Scan tab for setup")
     elif is_authenticated():
-        st.success("Connected")
+        st.success("Connected · auto-scanning")
+        if st.button("🔄 Refresh now", key="sidebar_refresh"):
+            with st.spinner("Scanning…"):
+                result = auto_scan_and_save(days_back=14)
+            if result.get("error"):
+                st.error(result["error"])
+            else:
+                st.success(f"+{result['new']} new · {result['skipped']} already saved")
     else:
-        st.info("Click 'Scan Gmail' to connect")
+        st.info("Click 'Scan Gmail' tab to connect")
 
     st.divider()
 
-    # ── Manual nudge trigger ──────────────────────────────────────────────────
+    # ── Nudge trigger ─────────────────────────────────────────────────────────
     st.markdown("**🔔 Nudges**")
     if st.button("Run scan now"):
         from scheduler.nudge_scheduler import run_nudge_scan
@@ -65,7 +84,6 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Settings expander ─────────────────────────────────────────────────────
     with st.expander("⚙️ Settings"):
         rows = {
             "ANTHROPIC_API_KEY":      "✅ set" if cfg.ANTHROPIC_API_KEY else "❌ missing",
@@ -84,7 +102,7 @@ with st.sidebar:
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_cal, tab_gmail, tab_pdf = st.tabs(["📅 Calendar", "📬 Gmail Scan", "📄 Upload PDF"])
+tab_cal, tab_gmail, tab_pdf = st.tabs(["📅 Calendar", "📬 Gmail Setup", "📄 Upload PDF"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -102,7 +120,7 @@ with tab_cal:
     events = _query_upcoming(days_ahead=days)
 
     if not events:
-        st.info(f"No events in the next {days} days. Scan Gmail or add one below.")
+        st.info(f"No events in the next {days} days. Gmail auto-scans on startup.")
     else:
         from itertools import groupby
         for event_date, group in groupby(events, key=lambda e: e["event_date"]):
@@ -133,7 +151,6 @@ with tab_cal:
     st.divider()
     st.subheader("Add or ask")
     st.caption('e.g. "Add dress-down day for Avery on May 9" · "What\'s happening this week?"')
-
     user_input = st.text_area("Command or question", height=68, key="nl_input",
                               placeholder='Try: "Avery has a recital June 3 at 6pm"')
     if st.button("Send ➤", key="nl_send", disabled=not (user_input or "").strip()):
@@ -144,115 +161,69 @@ with tab_cal:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — GMAIL SCAN
+# TAB 2 — GMAIL SETUP / MANUAL SCAN
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_gmail:
-    st.subheader("Scan Gmail for school events")
-
-    # ── Setup instructions ────────────────────────────────────────────────────
     if not is_credentials_configured():
-        st.error("Gmail not configured yet. Follow these steps:")
+        st.subheader("Connect Gmail")
+        st.error("Google credentials not found. Follow these steps:")
         st.markdown("""
-**One-time Google setup (5 minutes):**
+**One-time setup (5 minutes):**
 
-1. Go to [console.cloud.google.com](https://console.cloud.google.com) → New project → name it `Hearth`
-2. **APIs & Services** → Enable APIs → search **Gmail API** → Enable
-3. **APIs & Services** → OAuth consent screen → External → fill in app name → Save
-4. **APIs & Services** → Credentials → Create Credentials → **OAuth 2.0 Client ID**
-   - Application type: **Desktop app** → Create
-5. Download the JSON → save it as **`data/google_credentials.json`** in your Hearth project
-6. Come back here and click **Scan Gmail** — your browser will open for a one-time login
-
-After that, Hearth remembers your token and never asks again.
+1. Go to [console.cloud.google.com](https://console.cloud.google.com) → select your project
+2. **APIs & Services** → **Credentials** → **Create Credentials** → **OAuth 2.0 Client ID**
+   - Application type: **Desktop app** → Name: `Hearth` → Create
+3. Download the JSON → save as **`data/google_credentials.json`**
+4. **APIs & Services** → **OAuth consent screen** → **Test users** → add your Gmail address
+5. Restart the app — Gmail will auto-scan on every startup
         """)
-        st.stop()
+    else:
+        st.subheader("Gmail — auto-scanning")
 
-    # ── Scan UI ───────────────────────────────────────────────────────────────
-    st.caption(
-        "Hearth searches your inbox for school newsletters, dismissal notices, "
-        "recital reminders, and more — then extracts events for you to review."
-    )
+        if is_authenticated():
+            st.success("✅ Gmail connected. Hearth scans automatically every time you open the app.")
+            st.caption("New events are added silently. Duplicates are skipped automatically.")
 
-    c1, c2 = st.columns([2, 5])
-    with c1:
-        days_back = st.selectbox("Scan last", [7, 14, 30], index=1,
-                                  format_func=lambda d: f"{d} days")
-    with c2:
-        st.write("")
-        st.write("")
-        scan_btn = st.button("📬 Scan Gmail now", key="gmail_scan")
+            st.divider()
+            st.markdown("**Manual scan**")
+            st.caption("Force a fresh scan right now — useful after receiving a new newsletter.")
 
-    if not is_authenticated():
-        st.info("👆 First scan will open a browser window to connect your Google account. "
-                "This only happens once.")
-
-    if scan_btn:
-        with st.spinner("Connecting to Gmail and reading your inbox… (20–30 seconds)"):
-            result = scan_gmail_for_school_events(days_back=days_back)
-
-        if result.get("error"):
-            st.error(result["error"])
+            c1, c2 = st.columns([2, 5])
+            with c1:
+                days_back = st.selectbox("Scan last", [7, 14, 30], index=1,
+                                          format_func=lambda d: f"{d} days")
+            with c2:
+                st.write("")
+                st.write("")
+                if st.button("🔄 Scan now", key="gmail_manual_scan"):
+                    with st.spinner("Scanning Gmail…"):
+                        result = auto_scan_and_save(days_back=days_back)
+                    if result.get("error"):
+                        st.error(result["error"])
+                    else:
+                        st.success(
+                            f"Scanned {result['emails_scanned']} email(s) · "
+                            f"**{result['new']} new event(s) added** · "
+                            f"{result['skipped']} already in calendar"
+                        )
+                        if result["new"] > 0:
+                            st.rerun()
         else:
-            st.session_state["gmail_events"] = result.get("events", [])
-            st.success(result.get("response", "Scan complete."))
-
-    # ── Review & confirm ──────────────────────────────────────────────────────
-    if st.session_state.get("gmail_events"):
-        extracted = st.session_state["gmail_events"]
-        st.subheader(f"Review — {len(extracted)} event(s) found")
-        st.caption("Uncheck any you don't want to save, then click Save.")
-
-        keep_flags = []
-        for i, ev in enumerate(extracted):
-            label  = ev.get("event_type", "other").replace("_", " ").title()
-            source = ev.get("source_email", "")
-            display = (
-                f"**{ev.get('event_date')}** · {ev.get('child_name', 'all')} · {label}"
-                + (f" at {ev['event_time']}" if ev.get("event_time") else "")
-                + (f" — {ev['notes']}"       if ev.get("notes")      else "")
-                + (f" *(from: {source})*"    if source                else "")
-            )
-            keep = st.checkbox(display, value=True, key=f"gmail_keep_{i}")
-            keep_flags.append(keep)
-
-        if st.button("✅ Save selected events", key="gmail_save"):
-            to_save = [ev for ev, keep in zip(extracted, keep_flags) if keep]
-            saved   = 0
-            for ev in to_save:
-                try:
-                    _insert_event(
-                        child_name=ev.get("child_name", "all"),
-                        event_type=ev.get("event_type", "other"),
-                        event_date=ev["event_date"],
-                        event_time=ev.get("event_time"),
-                        notes=ev.get("notes"),
-                    )
-                    saved += 1
-                except Exception:
-                    pass
-            st.success(f"✅ {saved} event(s) saved to calendar.")
-            st.session_state.pop("gmail_events", None)
-            st.rerun()
-
-    elif not scan_btn:
-        st.markdown("""
-**What Hearth looks for:**
-
-| | Event type | Nudges |
-|---|---|---|
-| 👕 | Dress-down / spirit days | 48h + day-of |
-| 🏫 | Early dismissals | 48h + day-of |
-| 🎭 | Recitals and performances | 7d (costume) + 48h + day-of |
-| 🚌 | Field trips | 7d (permission slip) + 48h (packed lunch) + day-of |
-| 📸 | Picture days and special days | 48h + day-of |
-| 🏥 | Doctor appointments | 48h + day-of |
-| 📅 | Weekly preview | Every Sunday morning |
-        """)
+            st.info("Credentials found. Click below to connect your Google account.")
+            st.caption("A browser window will open once for sign-in. After that, it's automatic.")
+            if st.button("🔗 Connect Gmail now"):
+                with st.spinner("Opening browser for Google sign-in…"):
+                    result = auto_scan_and_save(days_back=14)
+                if result.get("error"):
+                    st.error(result["error"])
+                else:
+                    st.success(f"Connected! Added {result['new']} event(s).")
+                    st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — UPLOAD PDF (fallback)
+# TAB 3 — UPLOAD PDF
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_pdf:
@@ -285,7 +256,7 @@ with tab_pdf:
 
         if st.button("✅ Save selected events", key="pdf_save"):
             to_save = [ev for ev, keep in zip(extracted, keep_flags) if keep]
-            saved = 0
+            saved   = 0
             for ev in to_save:
                 try:
                     _insert_event(
