@@ -269,11 +269,87 @@ def agent_chat(req: AgentRequest):
 @app.post("/gmail/scan")
 def gmail_scan(user_id: str):
     try:
-        from agent.gmail_agent import auto_scan_and_save
+        import json
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        token_path = os.path.join(cfg.DATA_DIR, "tokens", user_id, "google_token.json")
+        if not os.path.exists(token_path):
+            return {"new": 0, "skipped": 0, "error": "Not authenticated"}
+        with open(token_path) as f:
+            token_data = json.load(f)
+        creds = Credentials(
+            token=token_data.get("access_token"),
+            refresh_token=token_data.get("refresh_token"),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+        )
+        if not creds.valid and creds.refresh_token:
+            creds.refresh(Request())
+            token_data["access_token"] = creds.token
+            with open(token_path, "w") as f:
+                json.dump(token_data, f)
+        from googleapiclient.discovery import build
+        import base64, re
+        from datetime import date, timedelta
+        import anthropic
+        service  = build("gmail", "v1", credentials=creds)
+        after    = (date.today()-timedelta(days=14)).strftime("%Y/%m/%d")
+        query    = ("(subject:(dismissal OR recital OR newsletter OR "no school" OR "                   ""dress down" OR "field trip" OR "early release" OR "                   ""school holiday" OR "picture day")) after:" + after)
+        result   = service.users().messages().list(userId="me", q=query, maxResults=50).execute()
+        messages = result.get("messages", [])
+        if not messages:
+            return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
+        emails = []
+        for msg in messages[:20]:
+            try:
+                full    = service.users().messages().get(userId="me", id=msg["id"], format="full").execute()
+                subject = next((h["value"] for h in full["payload"].get("headers", []) if h["name"]=="Subject"), "")
+                def extract_body(payload):
+                    data = payload.get("body", {}).get("data", "")
+                    if data and "text" in payload.get("mimeType", ""):
+                        try: return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                        except: return ""
+                    for part in payload.get("parts", []):
+                        t = extract_body(part)
+                        if t: return t
+                    return ""
+                body = extract_body(full["payload"])
+                if body: emails.append({"subject": subject, "body": body[:3000]})
+            except: continue
+        if not emails:
+            return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
         from agent.profile_agent import get_children
-        children = get_children(user_id)
-        result   = auto_scan_and_save(user_id, children, days_back=14)
-        return result
+        children     = get_children(user_id)
+        children_str = ", ".join(children) or "the children"
+        today_str    = date.today().strftime("%A, %B %d, %Y")
+        digest = "".join(f"--- {e['subject']} ---
+{e['body']}
+" for e in emails)
+        prompt = f"""Hearth assistant. Today: {today_str}. Children: {children_str}.
+Extract upcoming school events from these emails. Return JSON array:
+[{{"child_name":"...","event_type":"...","event_date":"YYYY-MM-DD","event_time":null,"notes":"..."}}]
+Valid event_type: dress_down_day,early_dismissal,recital,field_trip,special_day,doctor_appointment,sports_game,school_holiday,other
+Emails:
+{digest[:5000]}
+ONLY JSON array."""
+        client   = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+        resp     = client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=2048,
+                   messages=[{"role": "user", "content": prompt}])
+        raw      = resp.content[0].text.strip()
+        raw      = re.sub(r"^$", "", raw)
+        try:    events = json.loads(raw)
+        except: events = []
+        from agent.calendar_agent import _insert_event, _event_exists
+        new = skipped = 0
+        for ev in events:
+            child, etype, edate = ev.get("child_name","all"), ev.get("event_type","other"), ev.get("event_date","")
+            if not edate: continue
+            if _event_exists(user_id, child, etype, edate): skipped += 1; continue
+            _insert_event(user_id, child, etype, edate, ev.get("event_time"), ev.get("notes"))
+            new += 1
+        return {"new": new, "skipped": skipped, "emails_scanned": len(emails), "error": None}
     except Exception as e:
         return {"new": 0, "skipped": 0, "error": str(e)}
 
