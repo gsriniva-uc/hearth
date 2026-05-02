@@ -41,7 +41,7 @@ GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID",
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 BACKEND_REDIRECT_URI = os.getenv("BACKEND_REDIRECT_URI",
     "https://hearth-4kqf.onrender.com/auth/callback")
-APP_SCHEME           = "os.getenv("APP_SCHEME", "hearthfresh")"  # must match app.json scheme
+APP_SCHEME = os.getenv("APP_SCHEME", "hearthfresh")
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
