@@ -298,6 +298,17 @@ def save_profile(req: ProfileRequest):
     return {"status": "saved"}
 
 
+
+@app.get("/debug/token")
+def debug_token(user_id: str):
+    import os, json
+    token_path = os.path.join(cfg.DATA_DIR, "tokens", user_id, "google_token.json")
+    if not os.path.exists(token_path):
+        return {"exists": False, "path": token_path}
+    with open(token_path) as f:
+        data = json.load(f)
+    return {"exists": True, "keys": list(data.keys())}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=cfg.API_PORT, reload=True)
