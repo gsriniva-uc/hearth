@@ -1,32 +1,33 @@
 """
 main.py — Hearth FastAPI entry point
-
-Endpoints for React Native app + Google OAuth backend flow.
 """
-
+ 
 import os
 import json
 import hashlib
 import datetime
+import threading
+import re
+import base64
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
 import httpx
-
+ 
 import hearth_config as cfg
 from agent.calendar_agent import (
     init_db, _query_upcoming, _query_today,
-    _insert_event, _delete_event,
+    _insert_event, _delete_event, _event_exists,
 )
-from agent.profile_agent import init_profiles, get_all_profiles, upsert_profile
+from agent.profile_agent import init_profiles, get_all_profiles, upsert_profile, get_children
 from agent.briefing_agent import _build_briefing
 from agent.graph import run
 from db_migrate import migrate
-
+ 
 app = FastAPI(title="Hearth API", version="1.0.0")
-
+ 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,17 +35,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ── Google OAuth config ───────────────────────────────────────────────────────
+ 
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID",
     "289231572725-5fn10ulbb5hi6gqohnl1v6ourjsj01fu.apps.googleusercontent.com")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 BACKEND_REDIRECT_URI = os.getenv("BACKEND_REDIRECT_URI",
     "https://hearth-4kqf.onrender.com/auth/callback")
-APP_SCHEME           = "hearth-fresh"  # must match app.json scheme
-
-
-# ── Startup ───────────────────────────────────────────────────────────────────
+APP_SCHEME           = os.getenv("APP_SCHEME", "hearthfresh")
+ 
+ 
 @app.on_event("startup")
 def startup():
     os.makedirs(cfg.DATA_DIR, exist_ok=True)
@@ -52,42 +51,36 @@ def startup():
     init_db()
     init_profiles()
     print(f"[hearth] API started — DB at {cfg.DB_PATH}")
-
-
-# ── Health ────────────────────────────────────────────────────────────────────
+ 
+ 
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "1.0.0"}
-
-
-# ── Google OAuth — backend flow ───────────────────────────────────────────────
-
+ 
+ 
+# ── Auth ──────────────────────────────────────────────────────────────────────
+ 
 @app.get("/auth/login")
 def google_login():
-    """Step 1 — redirect user to Google consent screen."""
-    scope = " ".join([
-        "openid", "profile", "email",
-        "https://www.googleapis.com/auth/gmail.readonly",
-        "https://www.googleapis.com/auth/gmail.send",
-        "https://www.googleapis.com/auth/calendar",
-    ])
+    scope = ("openid profile email "
+             "https://www.googleapis.com/auth/gmail.readonly "
+             "https://www.googleapis.com/auth/gmail.send "
+             "https://www.googleapis.com/auth/calendar")
     url = (
         "https://accounts.google.com/o/oauth2/v2/auth"
-        f"?client_id={GOOGLE_CLIENT_ID}"
-        f"&redirect_uri={BACKEND_REDIRECT_URI}"
+        "?client_id=" + GOOGLE_CLIENT_ID +
+        "&redirect_uri=" + BACKEND_REDIRECT_URI +
         "&response_type=code"
-        f"&scope={scope.replace(' ', '%20')}"
+        "&scope=" + scope.replace(" ", "%20") +
         "&access_type=offline"
         "&prompt=consent"
     )
     return RedirectResponse(url)
-
-
+ 
+ 
 @app.get("/auth/callback")
 async def google_callback(code: str):
-    """Step 2 — Google redirects here with code, we exchange for token."""
     async with httpx.AsyncClient() as client:
-        # Exchange code for tokens
         token_res = await client.post(
             "https://oauth2.googleapis.com/token",
             data={
@@ -99,76 +92,65 @@ async def google_callback(code: str):
             }
         )
         token_data = token_res.json()
-
         if "error" in token_data:
-            raise HTTPException(status_code=400,
-                detail=f"Token error: {token_data.get('error_description', token_data['error'])}")
-
-        # Get user info
+            raise HTTPException(status_code=400, detail=str(token_data))
+ 
         user_res = await client.get(
             "https://www.googleapis.com/oauth2/v3/userinfo",
-            headers={"Authorization": f"Bearer {token_data['access_token']}"}
+            headers={"Authorization": "Bearer " + token_data["access_token"]}
         )
         user_info = user_res.json()
-
-    # Create stable user_id from email
+ 
     email   = user_info.get("email", "")
     user_id = hashlib.md5(email.lower().encode()).hexdigest()[:12]
-
-    # Save token scoped to this user
-    token_dir  = os.path.join(cfg.DATA_DIR, "tokens", user_id)
+ 
+    token_dir = os.path.join(cfg.DATA_DIR, "tokens", user_id)
     os.makedirs(token_dir, exist_ok=True)
-    token_path = os.path.join(token_dir, "google_token.json")
-    with open(token_path, "w") as f:
+    with open(os.path.join(token_dir, "google_token.json"), "w") as f:
         json.dump(token_data, f)
-
-    # Save session
-    session_dir  = os.path.join(cfg.DATA_DIR, "sessions")
+ 
+    session_dir = os.path.join(cfg.DATA_DIR, "sessions")
     os.makedirs(session_dir, exist_ok=True)
-    session_path = os.path.join(session_dir, f"{user_id}.json")
-    user_record  = {
+    user_record = {
         "user_id": user_id,
         "email":   email,
         "name":    user_info.get("name", email),
         "picture": user_info.get("picture", ""),
     }
-    with open(session_path, "w") as f:
+    with open(os.path.join(session_dir, user_id + ".json"), "w") as f:
         json.dump(user_record, f)
-
-    # Trigger Gmail scan in background — don't block the redirect
-    import threading
+ 
     def background_scan():
         try:
-            from agent.gmail_agent import auto_scan_and_save
-            from agent.profile_agent import get_children
-            children = get_children(user_id)
-            result   = auto_scan_and_save(user_id, children, days_back=14)
-            print(f"[gmail scan] user={user_id} new={result.get('new',0)}")
+            _gmail_scan_internal(user_id)
         except Exception as e:
-            print(f"[gmail scan error] {e}")
+            print("[gmail background] " + str(e))
     threading.Thread(target=background_scan, daemon=True).start()
-
-    # Return simple HTML page that opens the app
+ 
     import urllib.parse
-    from fastapi.responses import HTMLResponse
     user_json = urllib.parse.quote(json.dumps(user_record))
     token_val = urllib.parse.quote(token_data["access_token"])
     deep_link = APP_SCHEME + "://auth?user=" + user_json + "&token=" + token_val
-    name = user_record.get("name", "there")
-    html = "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    name      = user_record.get("name", "there")
+ 
+    html  = "<html><head>"
+    html += "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     html += "<script>setTimeout(function(){window.location.href='" + deep_link + "';},500);</script>"
-    html += "<style>body{font-family:sans-serif;text-align:center;padding:40px;background:#FFF8F0;color:#8B4513}"
-    html += "a{background:#E8734A;color:white;padding:16px 32px;border-radius:12px;text-decoration:none;font-size:18px}</style>"
-    html += "</head><body><h1>🏠</h1><h2>Welcome, " + name + "!</h2>"
+    html += "<style>body{font-family:sans-serif;text-align:center;padding:40px;"
+    html += "background:#FFF8F0;color:#8B4513}"
+    html += "a{background:#E8734A;color:white;padding:16px 32px;"
+    html += "border-radius:12px;text-decoration:none;font-size:18px;font-weight:bold}"
+    html += "</style></head><body>"
+    html += "<h1>&#127968;</h1>"
+    html += "<h2>Welcome, " + name + "!</h2>"
     html += "<p>Signed in to Hearth successfully.</p>"
     html += "<a href='" + deep_link + "'>Open Hearth App</a>"
     html += "</body></html>"
     return HTMLResponse(html)
-
-
+ 
+ 
 @app.post("/auth/register")
 def register_user(req: dict):
-    """Called by mobile app after OAuth to store token."""
     user    = req.get("user", {})
     user_id = user.get("user_id", "")
     token   = req.get("access_token", "")
@@ -178,17 +160,126 @@ def register_user(req: dict):
         with open(os.path.join(token_dir, "google_token.json"), "w") as f:
             json.dump({"access_token": token}, f)
     return {"status": "registered", "user_id": user_id}
-
-
+ 
+ 
+# ── Gmail scan (internal) ─────────────────────────────────────────────────────
+ 
+def _gmail_scan_internal(user_id: str) -> dict:
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+ 
+    token_path = os.path.join(cfg.DATA_DIR, "tokens", user_id, "google_token.json")
+    if not os.path.exists(token_path):
+        return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": "Not authenticated"}
+ 
+    with open(token_path) as f:
+        token_data = json.load(f)
+ 
+    creds = Credentials(
+        token=token_data.get("access_token"),
+        refresh_token=token_data.get("refresh_token"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+    )
+    if not creds.valid and creds.refresh_token:
+        creds.refresh(Request())
+        token_data["access_token"] = creds.token
+        with open(token_path, "w") as f:
+            json.dump(token_data, f)
+ 
+    service  = build("gmail", "v1", credentials=creds)
+    from datetime import date, timedelta
+    after    = (date.today() - timedelta(days=14)).strftime("%Y/%m/%d")
+    query    = ("(subject:(dismissal OR recital OR newsletter OR \"no school\" "
+                "OR \"dress down\" OR \"field trip\" OR \"early release\" "
+                "OR \"school holiday\" OR \"picture day\")) after:" + after)
+    result   = service.users().messages().list(userId="me", q=query, maxResults=50).execute()
+    messages = result.get("messages", [])
+    if not messages:
+        return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
+ 
+    def extract_body(payload):
+        data = payload.get("body", {}).get("data", "")
+        if data and "text" in payload.get("mimeType", ""):
+            try:
+                return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+            except:
+                return ""
+        for part in payload.get("parts", []):
+            t = extract_body(part)
+            if t:
+                return t
+        return ""
+ 
+    emails = []
+    for msg in messages[:20]:
+        try:
+            full    = service.users().messages().get(userId="me", id=msg["id"], format="full").execute()
+            subject = next((h["value"] for h in full["payload"].get("headers", [])
+                           if h["name"] == "Subject"), "")
+            body    = extract_body(full["payload"])
+            if body:
+                emails.append({"subject": subject, "body": body[:3000]})
+        except:
+            continue
+ 
+    if not emails:
+        return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
+ 
+    children_str = ", ".join(get_children(user_id)) or "the children"
+    today_str    = date.today().strftime("%A, %B %d, %Y")
+    digest       = "".join("--- " + e["subject"] + " ---\n" + e["body"] + "\n" for e in emails)
+ 
+    prompt = ("Hearth assistant. Today: " + today_str + ". Children: " + children_str + ".\n"
+              "Extract upcoming school events from these emails. Return JSON array:\n"
+              "[{\"child_name\":\"...\",\"event_type\":\"...\",\"event_date\":\"YYYY-MM-DD\","
+              "\"event_time\":null,\"notes\":\"...\"}]\n"
+              "Valid event_type: dress_down_day,early_dismissal,recital,field_trip,"
+              "special_day,doctor_appointment,sports_game,school_holiday,other\n"
+              "Emails:\n" + digest[:5000] + "\nONLY JSON array.")
+ 
+    import anthropic
+    client   = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+    resp     = client.messages.create(
+        model=cfg.CLAUDE_MODEL, max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}])
+    raw      = resp.content[0].text.strip()
+    raw      = re.sub(r"^```json\s*", "", raw)
+    raw      = re.sub(r"\s*```$", "", raw)
+    try:
+        events = json.loads(raw)
+    except:
+        events = []
+ 
+    new = skipped = 0
+    for ev in events:
+        child = ev.get("child_name", "all")
+        etype = ev.get("event_type", "other")
+        edate = ev.get("event_date", "")
+        if not edate:
+            continue
+        if _event_exists(user_id, child, etype, edate):
+            skipped += 1
+            continue
+        _insert_event(user_id, child, etype, edate, ev.get("event_time"), ev.get("notes"))
+        new += 1
+ 
+    return {"new": new, "skipped": skipped, "emails_scanned": len(emails), "error": None}
+ 
+ 
 # ── Events ────────────────────────────────────────────────────────────────────
+ 
 @app.get("/events")
 def get_events(user_id: str, days_ahead: int = 14):
     return _query_upcoming(user_id, days_ahead=days_ahead)
-
+ 
 @app.get("/events/today")
 def get_today(user_id: str):
     return _query_today(user_id)
-
+ 
 class EventRequest(BaseModel):
     user_id:    str
     child_name: str
@@ -196,49 +287,51 @@ class EventRequest(BaseModel):
     event_date: str
     event_time: Optional[str] = None
     notes:      Optional[str] = None
-
+ 
 @app.post("/events")
 def add_event(req: EventRequest):
     eid = _insert_event(req.user_id, req.child_name, req.event_type,
                         req.event_date, req.event_time, req.notes)
     return {"id": eid, "status": "created"}
-
+ 
 @app.delete("/events/{event_id}")
 def delete_event(event_id: int, user_id: str):
     ok = _delete_event(user_id, event_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Event not found")
     return {"status": "deleted"}
-
-
-# ── Tasks (stub) ──────────────────────────────────────────────────────────────
+ 
+ 
+# ── Tasks ─────────────────────────────────────────────────────────────────────
+ 
 @app.get("/tasks")
 def get_tasks(user_id: str, status: str = "pending"):
     return []
-
+ 
 @app.post("/tasks/{task_id}/send")
 def send_task(task_id: int, user_id: str):
     return {"status": "sent"}
-
+ 
 @app.post("/tasks/{task_id}/snooze")
 def snooze_task(task_id: int, user_id: str, days: int = 3):
     return {"status": "snoozed"}
-
+ 
 @app.post("/tasks/{task_id}/done")
 def done_task(task_id: int, user_id: str):
     return {"status": "done"}
-
+ 
 class VoiceRequest(BaseModel):
     user_id:    str
     transcript: str
-
+ 
 @app.post("/tasks/voice")
 def voice_task(req: VoiceRequest):
     result = run(raw_text=req.transcript, user_id=req.user_id)
     return {"status": "created", "response": result.get("response", "")}
-
-
+ 
+ 
 # ── Briefing ──────────────────────────────────────────────────────────────────
+ 
 @app.get("/briefing")
 def get_briefing(user_id: str):
     text     = _build_briefing(user_id)
@@ -252,113 +345,45 @@ def get_briefing(user_id: str):
         "this_week": upcoming,
         "tasks":     [],
     }
-
-
-# ── Agent / Chat ──────────────────────────────────────────────────────────────
+ 
+ 
+# ── Agent ─────────────────────────────────────────────────────────────────────
+ 
 class AgentRequest(BaseModel):
     user_id:  str
     raw_text: str
-
+ 
 @app.post("/agent")
 def agent_chat(req: AgentRequest):
     result = run(raw_text=req.raw_text, user_id=req.user_id)
     return {"response": result.get("response", "")}
-
-
+ 
+ 
 # ── Gmail ─────────────────────────────────────────────────────────────────────
+ 
 @app.post("/gmail/scan")
 def gmail_scan(user_id: str):
-    try:
-        import json
-        from google.oauth2.credentials import Credentials
-        from google.auth.transport.requests import Request
-        token_path = os.path.join(cfg.DATA_DIR, "tokens", user_id, "google_token.json")
-        if not os.path.exists(token_path):
-            return {"new": 0, "skipped": 0, "error": "Not authenticated"}
-        with open(token_path) as f:
-            token_data = json.load(f)
-        creds = Credentials(
-            token=token_data.get("access_token"),
-            refresh_token=token_data.get("refresh_token"),
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=GOOGLE_CLIENT_ID,
-            client_secret=GOOGLE_CLIENT_SECRET,
-            scopes=["https://www.googleapis.com/auth/gmail.readonly"],
-        )
-        if not creds.valid and creds.refresh_token:
-            creds.refresh(Request())
-            token_data["access_token"] = creds.token
-            with open(token_path, "w") as f:
-                json.dump(token_data, f)
-        from googleapiclient.discovery import build
-        import base64, re
-        from datetime import date, timedelta
-        import anthropic
-        service  = build("gmail", "v1", credentials=creds)
-        after    = (date.today()-timedelta(days=14)).strftime("%Y/%m/%d")
-        query    = ("(subject:(dismissal OR recital OR newsletter OR "no school" OR "                   ""dress down" OR "field trip" OR "early release" OR "                   ""school holiday" OR "picture day")) after:" + after)
-        result   = service.users().messages().list(userId="me", q=query, maxResults=50).execute()
-        messages = result.get("messages", [])
-        if not messages:
-            return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
-        emails = []
-        for msg in messages[:20]:
-            try:
-                full    = service.users().messages().get(userId="me", id=msg["id"], format="full").execute()
-                subject = next((h["value"] for h in full["payload"].get("headers", []) if h["name"]=="Subject"), "")
-                def extract_body(payload):
-                    data = payload.get("body", {}).get("data", "")
-                    if data and "text" in payload.get("mimeType", ""):
-                        try: return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-                        except: return ""
-                    for part in payload.get("parts", []):
-                        t = extract_body(part)
-                        if t: return t
-                    return ""
-                body = extract_body(full["payload"])
-                if body: emails.append({"subject": subject, "body": body[:3000]})
-            except: continue
-        if not emails:
-            return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
-        from agent.profile_agent import get_children
-        children     = get_children(user_id)
-        children_str = ", ".join(children) or "the children"
-        today_str    = date.today().strftime("%A, %B %d, %Y")
-        digest = "".join(f"--- {e['subject']} ---
-{e['body']}
-" for e in emails)
-        prompt = f"""Hearth assistant. Today: {today_str}. Children: {children_str}.
-Extract upcoming school events from these emails. Return JSON array:
-[{{"child_name":"...","event_type":"...","event_date":"YYYY-MM-DD","event_time":null,"notes":"..."}}]
-Valid event_type: dress_down_day,early_dismissal,recital,field_trip,special_day,doctor_appointment,sports_game,school_holiday,other
-Emails:
-{digest[:5000]}
-ONLY JSON array."""
-        client   = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
-        resp     = client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=2048,
-                   messages=[{"role": "user", "content": prompt}])
-        raw      = resp.content[0].text.strip()
-        raw      = re.sub(r"^$", "", raw)
-        try:    events = json.loads(raw)
-        except: events = []
-        from agent.calendar_agent import _insert_event, _event_exists
-        new = skipped = 0
-        for ev in events:
-            child, etype, edate = ev.get("child_name","all"), ev.get("event_type","other"), ev.get("event_date","")
-            if not edate: continue
-            if _event_exists(user_id, child, etype, edate): skipped += 1; continue
-            _insert_event(user_id, child, etype, edate, ev.get("event_time"), ev.get("notes"))
-            new += 1
-        return {"new": new, "skipped": skipped, "emails_scanned": len(emails), "error": None}
-    except Exception as e:
-        return {"new": 0, "skipped": 0, "error": str(e)}
-
-
+    return _gmail_scan_internal(user_id)
+ 
+ 
+# ── Debug ─────────────────────────────────────────────────────────────────────
+ 
+@app.get("/debug/token")
+def debug_token(user_id: str):
+    token_path = os.path.join(cfg.DATA_DIR, "tokens", user_id, "google_token.json")
+    if not os.path.exists(token_path):
+        return {"exists": False, "path": token_path}
+    with open(token_path) as f:
+        data = json.load(f)
+    return {"exists": True, "keys": list(data.keys())}
+ 
+ 
 # ── Profiles ──────────────────────────────────────────────────────────────────
+ 
 @app.get("/profiles")
 def get_profiles(user_id: str):
     return get_all_profiles(user_id)
-
+ 
 class ProfileRequest(BaseModel):
     user_id:    str
     name:       str
@@ -366,25 +391,15 @@ class ProfileRequest(BaseModel):
     school:     Optional[str] = None
     activities: Optional[str] = None
     notes:      Optional[str] = None
-
+ 
 @app.post("/profiles")
 def save_profile(req: ProfileRequest):
     upsert_profile(req.user_id, req.name, req.grade,
                    req.school, req.activities, req.notes)
     return {"status": "saved"}
-
-
-
-@app.get("/debug/token")
-def debug_token(user_id: str):
-    import os, json
-    token_path = os.path.join(cfg.DATA_DIR, "tokens", user_id, "google_token.json")
-    if not os.path.exists(token_path):
-        return {"exists": False, "path": token_path}
-    with open(token_path) as f:
-        data = json.load(f)
-    return {"exists": True, "keys": list(data.keys())}
-
+ 
+ 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=cfg.API_PORT, reload=True)
+ 
