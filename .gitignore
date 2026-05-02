@@ -37,3 +37,13 @@ Thumbs.db
 *.swp
 data/google_credentials.json
 data/google_token.json
+data/sessions/
+data/tokens/
+hearth-app/
+hearth-fresh/
+*.zip
+data/sessions/
+data/tokens/
+hearth-app/
+hearth-fresh/
+*.zip
