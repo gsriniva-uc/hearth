@@ -41,7 +41,7 @@ GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID",
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 BACKEND_REDIRECT_URI = os.getenv("BACKEND_REDIRECT_URI",
     "https://hearth-4kqf.onrender.com/auth/callback")
-APP_SCHEME = os.getenv("APP_SCHEME", "hearthfresh")
+APP_SCHEME           = "hearth-fresh"  # must match app.json scheme
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
@@ -135,14 +135,18 @@ async def google_callback(code: str):
     with open(session_path, "w") as f:
         json.dump(user_record, f)
 
-    # Trigger Gmail scan for this user
-    try:
-        from agent.gmail_agent import auto_scan_and_save
-        from agent.profile_agent import get_children
-        children = get_children(user_id)
-        auto_scan_and_save(user_id, children, days_back=14)
-    except Exception as e:
-        print(f"[startup gmail scan] {e}")
+    # Trigger Gmail scan in background — don't block the redirect
+    import threading
+    def background_scan():
+        try:
+            from agent.gmail_agent import auto_scan_and_save
+            from agent.profile_agent import get_children
+            children = get_children(user_id)
+            result   = auto_scan_and_save(user_id, children, days_back=14)
+            print(f"[gmail scan] user={user_id} new={result.get('new',0)}")
+        except Exception as e:
+            print(f"[gmail scan error] {e}")
+    threading.Thread(target=background_scan, daemon=True).start()
 
     # Redirect back to app with user info
     import urllib.parse
