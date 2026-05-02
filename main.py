@@ -148,13 +148,38 @@ async def google_callback(code: str):
             print(f"[gmail scan error] {e}")
     threading.Thread(target=background_scan, daemon=True).start()
 
-    # Redirect back to app with user info
+    # Return HTML page that opens the app
     import urllib.parse
     user_json = urllib.parse.quote(json.dumps(user_record))
     token     = urllib.parse.quote(token_data["access_token"])
-    return RedirectResponse(
-        f"{APP_SCHEME}://auth?user={user_json}&token={token}"
-    )
+    deep_link = f"{APP_SCHEME}://auth?user={user_json}&token={token}"
+    from fastapi.responses import HTMLResponse
+    html = f"""
+    <html>
+    <head>
+      <title>Hearth — Signed In</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body {{ font-family: sans-serif; text-align: center; padding: 40px;
+               background: #FFF8F0; color: #8B4513; }}
+        h1 {{ font-size: 48px; margin-bottom: 8px; }}
+        p  {{ color: #A0856B; margin-bottom: 32px; }}
+        a  {{ background: #E8734A; color: white; padding: 16px 32px;
+              border-radius: 12px; text-decoration: none;
+              font-size: 18px; font-weight: bold; }}
+      </style>
+      <script>window.location.href = "{deep_link}";</script>
+    </head>
+    <body>
+      <h1>🏠</h1>
+      <h2>Welcome, {user_record["name"]}!</h2>
+      <p>You are signed in to Hearth.</p>
+      <a href="{deep_link}">Open Hearth App</a>
+      <br><br>
+      <p style="font-size:12px">If the app doesn't open automatically, tap the button above.</p>
+    </body>
+    </html>"""
+    return HTMLResponse(html)
 
 
 @app.post("/auth/register")
