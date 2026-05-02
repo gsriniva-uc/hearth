@@ -1,21 +1,16 @@
 """
 main.py — Hearth FastAPI entry point
+Supports: proper login, multiple Gmail per user, invite sharing
 """
- 
-import os
-import json
-import hashlib
-import datetime
-import threading
-import re
-import base64
+
+import os, json, hashlib, datetime, threading, re, base64
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
 import httpx
- 
+
 import hearth_config as cfg
 from agent.calendar_agent import (
     init_db, _query_upcoming, _query_today,
@@ -25,157 +20,81 @@ from agent.profile_agent import init_profiles, get_all_profiles, upsert_profile,
 from agent.briefing_agent import _build_briefing
 from agent.graph import run
 from db_migrate import migrate
- 
+
 app = FastAPI(title="Hearth API", version="1.0.0")
- 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
- 
+
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
 GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID",
     "289231572725-5fn10ulbb5hi6gqohnl1v6ourjsj01fu.apps.googleusercontent.com")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 BACKEND_REDIRECT_URI = os.getenv("BACKEND_REDIRECT_URI",
     "https://hearth-4kqf.onrender.com/auth/callback")
 APP_SCHEME           = os.getenv("APP_SCHEME", "hearthfresh")
- 
- 
+
+GMAIL_SCOPES = [
+    "openid", "profile", "email",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/calendar",
+]
+
+
 @app.on_event("startup")
 def startup():
     os.makedirs(cfg.DATA_DIR, exist_ok=True)
     migrate()
     init_db()
     init_profiles()
-    print(f"[hearth] API started — DB at {cfg.DB_PATH}")
- 
- 
+    print(f"[hearth] started — {cfg.DB_PATH}")
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "1.0.0"}
- 
- 
-# ── Auth ──────────────────────────────────────────────────────────────────────
- 
-@app.get("/auth/login")
-def google_login():
-    scope = ("openid profile email "
-             "https://www.googleapis.com/auth/gmail.readonly "
-             "https://www.googleapis.com/auth/gmail.send "
-             "https://www.googleapis.com/auth/calendar")
-    url = (
-        "https://accounts.google.com/o/oauth2/v2/auth"
-        "?client_id=" + GOOGLE_CLIENT_ID +
-        "&redirect_uri=" + BACKEND_REDIRECT_URI +
-        "&response_type=code"
-        "&scope=" + scope.replace(" ", "%20") +
-        "&access_type=offline"
-        "&prompt=consent"
-    )
-    return RedirectResponse(url)
- 
- 
-@app.get("/auth/callback")
-async def google_callback(code: str):
-    async with httpx.AsyncClient() as client:
-        token_res = await client.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "code":          code,
-                "client_id":     GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "redirect_uri":  BACKEND_REDIRECT_URI,
-                "grant_type":    "authorization_code",
-            }
-        )
-        token_data = token_res.json()
-        if "error" in token_data:
-            raise HTTPException(status_code=400, detail=str(token_data))
- 
-        user_res = await client.get(
-            "https://www.googleapis.com/oauth2/v3/userinfo",
-            headers={"Authorization": "Bearer " + token_data["access_token"]}
-        )
-        user_info = user_res.json()
- 
-    email   = user_info.get("email", "")
-    user_id = hashlib.md5(email.lower().encode()).hexdigest()[:12]
- 
-    token_dir = os.path.join(cfg.DATA_DIR, "tokens", user_id)
-    os.makedirs(token_dir, exist_ok=True)
-    with open(os.path.join(token_dir, "google_token.json"), "w") as f:
+
+
+# ── Token helpers ─────────────────────────────────────────────────────────────
+
+def _token_dir(user_id: str) -> str:
+    d = os.path.join(cfg.DATA_DIR, "tokens", user_id)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _save_token(user_id: str, email: str, token_data: dict):
+    """Save Gmail token keyed by email address."""
+    safe_email = email.replace("@", "_at_").replace(".", "_")
+    path = os.path.join(_token_dir(user_id), f"gmail_{safe_email}.json")
+    with open(path, "w") as f:
         json.dump(token_data, f)
- 
-    session_dir = os.path.join(cfg.DATA_DIR, "sessions")
-    os.makedirs(session_dir, exist_ok=True)
-    user_record = {
-        "user_id": user_id,
-        "email":   email,
-        "name":    user_info.get("name", email),
-        "picture": user_info.get("picture", ""),
-    }
-    with open(os.path.join(session_dir, user_id + ".json"), "w") as f:
-        json.dump(user_record, f)
- 
-    def background_scan():
-        try:
-            _gmail_scan_internal(user_id)
-        except Exception as e:
-            print("[gmail background] " + str(e))
-    threading.Thread(target=background_scan, daemon=True).start()
- 
-    import urllib.parse
-    user_json = urllib.parse.quote(json.dumps(user_record))
-    token_val = urllib.parse.quote(token_data["access_token"])
-    deep_link = APP_SCHEME + "://auth?user=" + user_json + "&token=" + token_val
-    name      = user_record.get("name", "there")
- 
-    html  = "<html><head>"
-    html += "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    html += "<script>setTimeout(function(){window.location.href='" + deep_link + "';},500);</script>"
-    html += "<style>body{font-family:sans-serif;text-align:center;padding:40px;"
-    html += "background:#FFF8F0;color:#8B4513}"
-    html += "a{background:#E8734A;color:white;padding:16px 32px;"
-    html += "border-radius:12px;text-decoration:none;font-size:18px;font-weight:bold}"
-    html += "</style></head><body>"
-    html += "<h1>&#127968;</h1>"
-    html += "<h2>Welcome, " + name + "!</h2>"
-    html += "<p>Signed in to Hearth successfully.</p>"
-    html += "<a href='" + deep_link + "'>Open Hearth App</a>"
-    html += "</body></html>"
-    return HTMLResponse(html)
- 
- 
-@app.post("/auth/register")
-def register_user(req: dict):
-    user    = req.get("user", {})
-    user_id = user.get("user_id", "")
-    token   = req.get("access_token", "")
-    if user_id and token:
-        token_dir = os.path.join(cfg.DATA_DIR, "tokens", user_id)
-        os.makedirs(token_dir, exist_ok=True)
-        with open(os.path.join(token_dir, "google_token.json"), "w") as f:
-            json.dump({"access_token": token}, f)
-    return {"status": "registered", "user_id": user_id}
- 
- 
-# ── Gmail scan (internal) ─────────────────────────────────────────────────────
- 
-def _gmail_scan_internal(user_id: str) -> dict:
+
+def _load_token(user_id: str, email: str) -> dict | None:
+    safe_email = email.replace("@", "_at_").replace(".", "_")
+    path = os.path.join(_token_dir(user_id), f"gmail_{safe_email}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+def _list_connected_emails(user_id: str) -> list[str]:
+    """List all Gmail accounts connected for this user."""
+    d = _token_dir(user_id)
+    emails = []
+    for fname in os.listdir(d):
+        if fname.startswith("gmail_") and fname.endswith(".json"):
+            safe = fname[6:-5]  # strip gmail_ and .json
+            email = safe.replace("_at_", "@").replace("_", ".", 1)
+            emails.append(email)
+    return emails
+
+def _get_gmail_creds(user_id: str, email: str):
+    """Build Google Credentials object for a connected Gmail account."""
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
-    from googleapiclient.discovery import build
- 
-    token_path = os.path.join(cfg.DATA_DIR, "tokens", user_id, "google_token.json")
-    if not os.path.exists(token_path):
-        return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": "Not authenticated"}
- 
-    with open(token_path) as f:
-        token_data = json.load(f)
- 
+    token_data = _load_token(user_id, email)
+    if not token_data:
+        return None
     creds = Credentials(
         token=token_data.get("access_token"),
         refresh_token=token_data.get("refresh_token"),
@@ -185,221 +104,355 @@ def _gmail_scan_internal(user_id: str) -> dict:
         scopes=["https://www.googleapis.com/auth/gmail.readonly"],
     )
     if not creds.valid and creds.refresh_token:
-        creds.refresh(Request())
-        token_data["access_token"] = creds.token
-        with open(token_path, "w") as f:
-            json.dump(token_data, f)
- 
-    service  = build("gmail", "v1", credentials=creds)
+        try:
+            creds.refresh(Request())
+            token_data["access_token"] = creds.token
+            _save_token(user_id, email, token_data)
+        except Exception as e:
+            print(f"[token refresh] {email}: {e}")
+    return creds if creds.valid else None
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+@app.get("/auth/login")
+def google_login(user_id: str = "", add_account: bool = False):
+    """
+    Start Google OAuth flow.
+    user_id + add_account=true → adding a second Gmail to existing user
+    """
+    scope = "%20".join(GMAIL_SCOPES)
+    state = json.dumps({"user_id": user_id, "add_account": add_account})
+    import urllib.parse
+    url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        "?client_id=" + GOOGLE_CLIENT_ID +
+        "&redirect_uri=" + BACKEND_REDIRECT_URI +
+        "&response_type=code"
+        "&scope=" + scope +
+        "&access_type=offline"
+        "&prompt=consent"
+        "&state=" + urllib.parse.quote(state)
+    )
+    return RedirectResponse(url)
+
+
+@app.get("/auth/callback")
+async def google_callback(code: str, state: str = "{}"):
+    import urllib.parse
+    try:
+        state_data   = json.loads(urllib.parse.unquote(state))
+        existing_uid = state_data.get("user_id", "")
+        add_account  = state_data.get("add_account", False)
+    except:
+        existing_uid = ""
+        add_account  = False
+
+    async with httpx.AsyncClient() as client:
+        token_res = await client.post("https://oauth2.googleapis.com/token", data={
+            "code": code, "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": BACKEND_REDIRECT_URI, "grant_type": "authorization_code",
+        })
+        token_data = token_res.json()
+        if "error" in token_data:
+            raise HTTPException(400, str(token_data))
+
+        user_res  = await client.get("https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": "Bearer " + token_data["access_token"]})
+        user_info = user_res.json()
+
+    email   = user_info.get("email", "")
+    user_id = existing_uid if (add_account and existing_uid) else \
+              hashlib.md5(email.lower().encode()).hexdigest()[:12]
+
+    # Save token keyed by email
+    _save_token(user_id, email, token_data)
+
+    user_record = {
+        "user_id": user_id,
+        "email":   email if not add_account else
+                   (json.loads(open(os.path.join(cfg.DATA_DIR, "sessions",
+                    user_id + ".json")).read()).get("email", email)
+                    if os.path.exists(os.path.join(cfg.DATA_DIR, "sessions", user_id + ".json"))
+                    else email),
+        "name":    user_info.get("name", email) if not add_account else
+                   (json.loads(open(os.path.join(cfg.DATA_DIR, "sessions",
+                    user_id + ".json")).read()).get("name", user_info.get("name", email))
+                    if os.path.exists(os.path.join(cfg.DATA_DIR, "sessions", user_id + ".json"))
+                    else user_info.get("name", email)),
+        "picture": user_info.get("picture", ""),
+    }
+
+    # Save session (only for primary login)
+    session_dir = os.path.join(cfg.DATA_DIR, "sessions")
+    os.makedirs(session_dir, exist_ok=True)
+    session_path = os.path.join(session_dir, user_id + ".json")
+    if not add_account or not os.path.exists(session_path):
+        with open(session_path, "w") as f:
+            json.dump(user_record, f)
+
+    # Background Gmail scan for newly connected account
+    def bg_scan():
+        try:
+            _scan_single_gmail(user_id, email)
+        except Exception as e:
+            print(f"[bg scan] {e}")
+    threading.Thread(target=bg_scan, daemon=True).start()
+
+    # Build deep link + HTML page
+    import urllib.parse as up
+    user_json = up.quote(json.dumps(user_record))
+    token_val = up.quote(token_data["access_token"])
+    deep_link = APP_SCHEME + "://auth?user=" + user_json + "&token=" + token_val
+    name      = user_record.get("name", "there")
+    msg       = ("Gmail account added to your family calendar!" if add_account
+                 else "Signed in to Hearth successfully.")
+
+    html  = "<html><head>"
+    html += "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    html += "<script>setTimeout(function(){window.location.href='" + deep_link + "';},800);</script>"
+    html += "<style>body{font-family:sans-serif;text-align:center;padding:40px;"
+    html += "background:#FFF8F0;color:#8B4513;}"
+    html += "a{background:#E8734A;color:white;padding:16px 32px;"
+    html += "border-radius:12px;text-decoration:none;font-size:18px;font-weight:bold}"
+    html += "</style></head><body>"
+    html += "<h1>&#127968;</h1>"
+    html += "<h2>Welcome, " + name + "!</h2>"
+    html += "<p>" + msg + "</p>"
+    html += "<a href='" + deep_link + "'>Open Hearth App</a>"
+    html += "<p style='font-size:12px;margin-top:20px;color:#A0856B'>"
+    html += "Tap the button above if the app doesn't open automatically.</p>"
+    html += "</body></html>"
+    return HTMLResponse(html)
+
+
+@app.post("/auth/register")
+def register_user(req: dict):
+    user    = req.get("user", {})
+    user_id = user.get("user_id", "")
+    email   = user.get("email", "")
+    token   = req.get("access_token", "")
+    if user_id and token and email:
+        _save_token(user_id, email, {"access_token": token})
+    return {"status": "registered", "user_id": user_id}
+
+
+# ── Gmail scan ────────────────────────────────────────────────────────────────
+
+def _scan_single_gmail(user_id: str, email: str) -> dict:
+    """Scan one Gmail account for school events."""
+    from googleapiclient.discovery import build
     from datetime import date, timedelta
-    after    = (date.today() - timedelta(days=14)).strftime("%Y/%m/%d")
-    query    = ("(subject:(dismissal OR recital OR newsletter OR \"no school\" "
-                "OR \"dress down\" OR \"field trip\" OR \"early release\" "
-                "OR \"school holiday\" OR \"picture day\")) after:" + after)
-    result   = service.users().messages().list(userId="me", q=query, maxResults=50).execute()
+    import anthropic
+
+    creds = _get_gmail_creds(user_id, email)
+    if not creds:
+        return {"new": 0, "skipped": 0, "emails_scanned": 0,
+                "error": f"Not authenticated: {email}"}
+
+    service = build("gmail", "v1", credentials=creds)
+    after   = (date.today() - timedelta(days=14)).strftime("%Y/%m/%d")
+    query   = ("(subject:(dismissal OR recital OR newsletter OR \"no school\" "
+               "OR \"dress down\" OR \"field trip\" OR \"early release\" "
+               "OR \"school holiday\" OR \"picture day\")) after:" + after)
+    result  = service.users().messages().list(
+        userId="me", q=query, maxResults=50).execute()
     messages = result.get("messages", [])
     if not messages:
         return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
- 
+
     def extract_body(payload):
         data = payload.get("body", {}).get("data", "")
         if data and "text" in payload.get("mimeType", ""):
-            try:
-                return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-            except:
-                return ""
+            try: return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+            except: return ""
         for part in payload.get("parts", []):
             t = extract_body(part)
-            if t:
-                return t
+            if t: return t
         return ""
- 
+
     emails = []
     for msg in messages[:20]:
         try:
-            full    = service.users().messages().get(userId="me", id=msg["id"], format="full").execute()
+            full    = service.users().messages().get(
+                userId="me", id=msg["id"], format="full").execute()
             subject = next((h["value"] for h in full["payload"].get("headers", [])
                            if h["name"] == "Subject"), "")
             body    = extract_body(full["payload"])
-            if body:
-                emails.append({"subject": subject, "body": body[:3000]})
-        except:
-            continue
- 
+            if body: emails.append({"subject": subject, "body": body[:3000]})
+        except: continue
+
     if not emails:
         return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
- 
+
     children_str = ", ".join(get_children(user_id)) or "the children"
     today_str    = date.today().strftime("%A, %B %d, %Y")
-    digest       = "".join("--- " + e["subject"] + " ---\n" + e["body"] + "\n" for e in emails)
- 
-    prompt = ("Hearth assistant. Today: " + today_str + ". Children: " + children_str + ".\n"
-              "Extract upcoming school events from these emails. Return JSON array:\n"
-              "[{\"child_name\":\"...\",\"event_type\":\"...\",\"event_date\":\"YYYY-MM-DD\","
-              "\"event_time\":null,\"notes\":\"...\"}]\n"
+    digest       = "".join("--- " + e["subject"] + " ---\n" + e["body"] + "\n"
+                           for e in emails)
+
+    prompt = ("Hearth assistant. Today: " + today_str +
+              ". Children: " + children_str + ".\n"
+              "Extract upcoming school events. Return JSON array:\n"
+              "[{\"child_name\":\"...\",\"event_type\":\"...\","
+              "\"event_date\":\"YYYY-MM-DD\",\"event_time\":null,\"notes\":\"...\"}]\n"
               "Valid event_type: dress_down_day,early_dismissal,recital,field_trip,"
               "special_day,doctor_appointment,sports_game,school_holiday,other\n"
               "Emails:\n" + digest[:5000] + "\nONLY JSON array.")
- 
-    import anthropic
-    client   = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
-    resp     = client.messages.create(
-        model=cfg.CLAUDE_MODEL, max_tokens=2048,
-        messages=[{"role": "user", "content": prompt}])
-    raw      = resp.content[0].text.strip()
-    raw      = re.sub(r"^```json\s*", "", raw)
-    raw      = re.sub(r"\s*```$", "", raw)
-    try:
-        events = json.loads(raw)
-    except:
-        events = []
- 
+
+    client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+    resp   = client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=2048,
+             messages=[{"role": "user", "content": prompt}])
+    raw    = re.sub(r"^```json\s*", "", resp.content[0].text.strip())
+    raw    = re.sub(r"\s*```$", "", raw)
+    try:    events = json.loads(raw)
+    except: events = []
+
     new = skipped = 0
     for ev in events:
         child = ev.get("child_name", "all")
         etype = ev.get("event_type", "other")
         edate = ev.get("event_date", "")
-        if not edate:
-            continue
-        if _event_exists(user_id, child, etype, edate):
-            skipped += 1
-            continue
+        if not edate: continue
+        if _event_exists(user_id, child, etype, edate): skipped += 1; continue
         _insert_event(user_id, child, etype, edate, ev.get("event_time"), ev.get("notes"))
         new += 1
- 
+
     return {"new": new, "skipped": skipped, "emails_scanned": len(emails), "error": None}
- 
- 
+
+
+@app.post("/gmail/scan")
+def gmail_scan(user_id: str):
+    """Scan primary Gmail account."""
+    emails = _list_connected_emails(user_id)
+    if not emails:
+        return {"new": 0, "skipped": 0, "error": "No Gmail accounts connected"}
+    return _scan_single_gmail(user_id, emails[0])
+
+
+@app.post("/gmail/scan-all")
+def gmail_scan_all(user_id: str):
+    """Scan ALL connected Gmail accounts for this user."""
+    emails = _list_connected_emails(user_id)
+    if not emails:
+        return {"new": 0, "skipped": 0, "accounts_scanned": 0,
+                "error": "No Gmail accounts connected"}
+    total_new = total_skipped = 0
+    for email in emails:
+        result = _scan_single_gmail(user_id, email)
+        total_new     += result.get("new", 0)
+        total_skipped += result.get("skipped", 0)
+    return {"new": total_new, "skipped": total_skipped,
+            "accounts_scanned": len(emails), "error": None}
+
+
+@app.get("/connected-gmails")
+def connected_gmails(user_id: str):
+    return {"emails": _list_connected_emails(user_id)}
+
+
 # ── Events ────────────────────────────────────────────────────────────────────
- 
+
 @app.get("/events")
 def get_events(user_id: str, days_ahead: int = 14):
     return _query_upcoming(user_id, days_ahead=days_ahead)
- 
+
 @app.get("/events/today")
 def get_today(user_id: str):
     return _query_today(user_id)
- 
+
 class EventRequest(BaseModel):
-    user_id:    str
-    child_name: str
-    event_type: str
-    event_date: str
-    event_time: Optional[str] = None
-    notes:      Optional[str] = None
- 
+    user_id: str; child_name: str; event_type: str; event_date: str
+    event_time: Optional[str] = None; notes: Optional[str] = None
+
 @app.post("/events")
 def add_event(req: EventRequest):
     eid = _insert_event(req.user_id, req.child_name, req.event_type,
                         req.event_date, req.event_time, req.notes)
     return {"id": eid, "status": "created"}
- 
+
 @app.delete("/events/{event_id}")
 def delete_event(event_id: int, user_id: str):
-    ok = _delete_event(user_id, event_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail="Event not found")
+    if not _delete_event(user_id, event_id):
+        raise HTTPException(404, "Event not found")
     return {"status": "deleted"}
- 
- 
+
+
 # ── Tasks ─────────────────────────────────────────────────────────────────────
- 
+
 @app.get("/tasks")
 def get_tasks(user_id: str, status: str = "pending"):
     return []
- 
+
 @app.post("/tasks/{task_id}/send")
-def send_task(task_id: int, user_id: str):
-    return {"status": "sent"}
- 
+def send_task(task_id: int, user_id: str): return {"status": "sent"}
+
 @app.post("/tasks/{task_id}/snooze")
-def snooze_task(task_id: int, user_id: str, days: int = 3):
-    return {"status": "snoozed"}
- 
+def snooze_task(task_id: int, user_id: str, days: int = 3): return {"status": "snoozed"}
+
 @app.post("/tasks/{task_id}/done")
-def done_task(task_id: int, user_id: str):
-    return {"status": "done"}
- 
+def done_task(task_id: int, user_id: str): return {"status": "done"}
+
 class VoiceRequest(BaseModel):
-    user_id:    str
-    transcript: str
- 
+    user_id: str; transcript: str
+
 @app.post("/tasks/voice")
 def voice_task(req: VoiceRequest):
     result = run(raw_text=req.transcript, user_id=req.user_id)
     return {"status": "created", "response": result.get("response", "")}
- 
- 
+
+
 # ── Briefing ──────────────────────────────────────────────────────────────────
- 
+
 @app.get("/briefing")
 def get_briefing(user_id: str):
     text     = _build_briefing(user_id)
     today    = _query_today(user_id)
     upcoming = _query_upcoming(user_id, days_ahead=7)
     tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
-    return {
-        "text":      text,
-        "today":     today,
-        "tomorrow":  [e for e in upcoming if e["event_date"] == tomorrow],
-        "this_week": upcoming,
-        "tasks":     [],
-    }
- 
- 
+    return {"text": text, "today": today,
+            "tomorrow": [e for e in upcoming if e["event_date"] == tomorrow],
+            "this_week": upcoming, "tasks": []}
+
+
 # ── Agent ─────────────────────────────────────────────────────────────────────
- 
+
 class AgentRequest(BaseModel):
-    user_id:  str
-    raw_text: str
- 
+    user_id: str; raw_text: str
+
 @app.post("/agent")
 def agent_chat(req: AgentRequest):
     result = run(raw_text=req.raw_text, user_id=req.user_id)
     return {"response": result.get("response", "")}
- 
- 
-# ── Gmail ─────────────────────────────────────────────────────────────────────
- 
-@app.post("/gmail/scan")
-def gmail_scan(user_id: str):
-    return _gmail_scan_internal(user_id)
- 
- 
-# ── Debug ─────────────────────────────────────────────────────────────────────
- 
-@app.get("/debug/token")
-def debug_token(user_id: str):
-    token_path = os.path.join(cfg.DATA_DIR, "tokens", user_id, "google_token.json")
-    if not os.path.exists(token_path):
-        return {"exists": False, "path": token_path}
-    with open(token_path) as f:
-        data = json.load(f)
-    return {"exists": True, "keys": list(data.keys())}
- 
- 
+
+
 # ── Profiles ──────────────────────────────────────────────────────────────────
- 
+
 @app.get("/profiles")
 def get_profiles(user_id: str):
     return get_all_profiles(user_id)
- 
+
 class ProfileRequest(BaseModel):
-    user_id:    str
-    name:       str
-    grade:      Optional[str] = None
-    school:     Optional[str] = None
-    activities: Optional[str] = None
-    notes:      Optional[str] = None
- 
+    user_id: str; name: str
+    grade: Optional[str]=None; school: Optional[str]=None
+    activities: Optional[str]=None; notes: Optional[str]=None
+
 @app.post("/profiles")
 def save_profile(req: ProfileRequest):
     upsert_profile(req.user_id, req.name, req.grade,
                    req.school, req.activities, req.notes)
     return {"status": "saved"}
- 
- 
+
+
+# ── Debug ─────────────────────────────────────────────────────────────────────
+
+@app.get("/debug/token")
+def debug_token(user_id: str):
+    emails = _list_connected_emails(user_id)
+    return {"connected_emails": emails,
+            "token_dir": _token_dir(user_id)}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=cfg.API_PORT, reload=True)
- 
