@@ -1,6 +1,5 @@
 """
 main.py — Hearth FastAPI entry point
-Supports: proper login, multiple Gmail per user, invite sharing
 """
 
 import os, json, hashlib, datetime, threading, re, base64
@@ -38,6 +37,7 @@ GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/cloud-platform",
 ]
 
 
@@ -63,7 +63,6 @@ def _token_dir(user_id: str) -> str:
     return d
 
 def _save_token(user_id: str, email: str, token_data: dict):
-    """Save Gmail token keyed by email address."""
     safe_email = email.replace("@", "_at_").replace(".", "_")
     path = os.path.join(_token_dir(user_id), f"gmail_{safe_email}.json")
     with open(path, "w") as f:
@@ -78,18 +77,17 @@ def _load_token(user_id: str, email: str) -> dict | None:
         return json.load(f)
 
 def _list_connected_emails(user_id: str) -> list[str]:
-    """List all Gmail accounts connected for this user."""
     d = _token_dir(user_id)
     emails = []
     for fname in os.listdir(d):
         if fname.startswith("gmail_") and fname.endswith(".json"):
-            safe = fname[6:-5]  # strip gmail_ and .json
+            safe  = fname[6:-5]
             email = safe.replace("_at_", "@").replace("_", ".", 1)
             emails.append(email)
     return emails
 
-def _get_gmail_creds(user_id: str, email: str):
-    """Build Google Credentials object for a connected Gmail account."""
+def _get_fresh_token(user_id: str, email: str) -> str | None:
+    """Get a valid access token, refreshing if needed."""
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
     token_data = _load_token(user_id, email)
@@ -101,7 +99,7 @@ def _get_gmail_creds(user_id: str, email: str):
         token_uri="https://oauth2.googleapis.com/token",
         client_id=GOOGLE_CLIENT_ID,
         client_secret=GOOGLE_CLIENT_SECRET,
-        scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+        scopes=GMAIL_SCOPES,
     )
     if not creds.valid and creds.refresh_token:
         try:
@@ -109,18 +107,15 @@ def _get_gmail_creds(user_id: str, email: str):
             token_data["access_token"] = creds.token
             _save_token(user_id, email, token_data)
         except Exception as e:
-            print(f"[token refresh] {email}: {e}")
-    return creds if creds.valid else None
+            print(f"[token refresh] {e}")
+            return None
+    return creds.token if creds.valid else None
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 @app.get("/auth/login")
 def google_login(user_id: str = "", add_account: bool = False):
-    """
-    Start Google OAuth flow.
-    user_id + add_account=true → adding a second Gmail to existing user
-    """
     scope = "%20".join(GMAIL_SCOPES)
     state = json.dumps({"user_id": user_id, "add_account": add_account})
     import urllib.parse
@@ -157,7 +152,6 @@ async def google_callback(code: str, state: str = "{}"):
         token_data = token_res.json()
         if "error" in token_data:
             raise HTTPException(400, str(token_data))
-
         user_res  = await client.get("https://www.googleapis.com/oauth2/v3/userinfo",
             headers={"Authorization": "Bearer " + token_data["access_token"]})
         user_info = user_res.json()
@@ -166,33 +160,24 @@ async def google_callback(code: str, state: str = "{}"):
     user_id = existing_uid if (add_account and existing_uid) else \
               hashlib.md5(email.lower().encode()).hexdigest()[:12]
 
-    # Save token keyed by email
     _save_token(user_id, email, token_data)
 
-    user_record = {
-        "user_id": user_id,
-        "email":   email if not add_account else
-                   (json.loads(open(os.path.join(cfg.DATA_DIR, "sessions",
-                    user_id + ".json")).read()).get("email", email)
-                    if os.path.exists(os.path.join(cfg.DATA_DIR, "sessions", user_id + ".json"))
-                    else email),
-        "name":    user_info.get("name", email) if not add_account else
-                   (json.loads(open(os.path.join(cfg.DATA_DIR, "sessions",
-                    user_id + ".json")).read()).get("name", user_info.get("name", email))
-                    if os.path.exists(os.path.join(cfg.DATA_DIR, "sessions", user_id + ".json"))
-                    else user_info.get("name", email)),
-        "picture": user_info.get("picture", ""),
-    }
-
-    # Save session (only for primary login)
-    session_dir = os.path.join(cfg.DATA_DIR, "sessions")
+    session_dir  = os.path.join(cfg.DATA_DIR, "sessions")
     os.makedirs(session_dir, exist_ok=True)
     session_path = os.path.join(session_dir, user_id + ".json")
+
     if not add_account or not os.path.exists(session_path):
+        user_record = {
+            "user_id": user_id, "email": email,
+            "name": user_info.get("name", email),
+            "picture": user_info.get("picture", ""),
+        }
         with open(session_path, "w") as f:
             json.dump(user_record, f)
+    else:
+        with open(session_path) as f:
+            user_record = json.load(f)
 
-    # Background Gmail scan for newly connected account
     def bg_scan():
         try:
             _scan_single_gmail(user_id, email)
@@ -200,29 +185,22 @@ async def google_callback(code: str, state: str = "{}"):
             print(f"[bg scan] {e}")
     threading.Thread(target=bg_scan, daemon=True).start()
 
-    # Build deep link + HTML page
     import urllib.parse as up
     user_json = up.quote(json.dumps(user_record))
     token_val = up.quote(token_data["access_token"])
     deep_link = APP_SCHEME + "://auth?user=" + user_json + "&token=" + token_val
     name      = user_record.get("name", "there")
-    msg       = ("Gmail account added to your family calendar!" if add_account
-                 else "Signed in to Hearth successfully.")
+    msg       = "Gmail account added!" if add_account else "Signed in to Hearth successfully."
 
     html  = "<html><head>"
     html += "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     html += "<script>setTimeout(function(){window.location.href='" + deep_link + "';},800);</script>"
-    html += "<style>body{font-family:sans-serif;text-align:center;padding:40px;"
-    html += "background:#FFF8F0;color:#8B4513;}"
-    html += "a{background:#E8734A;color:white;padding:16px 32px;"
-    html += "border-radius:12px;text-decoration:none;font-size:18px;font-weight:bold}"
+    html += "<style>body{font-family:sans-serif;text-align:center;padding:40px;background:#FFF8F0;color:#8B4513}"
+    html += "a{background:#E8734A;color:white;padding:16px 32px;border-radius:12px;text-decoration:none;font-size:18px;font-weight:bold}"
     html += "</style></head><body>"
-    html += "<h1>&#127968;</h1>"
-    html += "<h2>Welcome, " + name + "!</h2>"
+    html += "<h1>&#127968;</h1><h2>Welcome, " + name + "!</h2>"
     html += "<p>" + msg + "</p>"
     html += "<a href='" + deep_link + "'>Open Hearth App</a>"
-    html += "<p style='font-size:12px;margin-top:20px;color:#A0856B'>"
-    html += "Tap the button above if the app doesn't open automatically.</p>"
     html += "</body></html>"
     return HTMLResponse(html)
 
@@ -238,19 +216,34 @@ def register_user(req: dict):
     return {"status": "registered", "user_id": user_id}
 
 
+# ── Speech token ──────────────────────────────────────────────────────────────
+
+@app.get("/auth/speech-token")
+def get_speech_token(user_id: str):
+    """Return a valid Google access token for Speech-to-Text API calls from the app."""
+    emails = _list_connected_emails(user_id)
+    if not emails:
+        return {"token": None, "error": "Not authenticated"}
+    token = _get_fresh_token(user_id, emails[0])
+    if not token:
+        return {"token": None, "error": "Could not refresh token"}
+    return {"token": token, "error": None}
+
+
 # ── Gmail scan ────────────────────────────────────────────────────────────────
 
 def _scan_single_gmail(user_id: str, email: str) -> dict:
-    """Scan one Gmail account for school events."""
     from googleapiclient.discovery import build
     from datetime import date, timedelta
     import anthropic
 
-    creds = _get_gmail_creds(user_id, email)
-    if not creds:
+    token = _get_fresh_token(user_id, email)
+    if not token:
         return {"new": 0, "skipped": 0, "emails_scanned": 0,
                 "error": f"Not authenticated: {email}"}
 
+    from google.oauth2.credentials import Credentials
+    creds   = Credentials(token=token)
     service = build("gmail", "v1", credentials=creds)
     after   = (date.today() - timedelta(days=14)).strftime("%Y/%m/%d")
     query   = ("(subject:(dismissal OR recital OR newsletter OR \"no school\" "
@@ -272,7 +265,7 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
             if t: return t
         return ""
 
-    emails = []
+    emails_data = []
     for msg in messages[:20]:
         try:
             full    = service.users().messages().get(
@@ -280,16 +273,16 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
             subject = next((h["value"] for h in full["payload"].get("headers", [])
                            if h["name"] == "Subject"), "")
             body    = extract_body(full["payload"])
-            if body: emails.append({"subject": subject, "body": body[:3000]})
+            if body: emails_data.append({"subject": subject, "body": body[:3000]})
         except: continue
 
-    if not emails:
+    if not emails_data:
         return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
 
     children_str = ", ".join(get_children(user_id)) or "the children"
-    today_str    = date.today().strftime("%A, %B %d, %Y")
+    today_str    = datetime.date.today().strftime("%A, %B %d, %Y")
     digest       = "".join("--- " + e["subject"] + " ---\n" + e["body"] + "\n"
-                           for e in emails)
+                           for e in emails_data)
 
     prompt = ("Hearth assistant. Today: " + today_str +
               ". Children: " + children_str + ".\n"
@@ -300,7 +293,8 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
               "special_day,doctor_appointment,sports_game,school_holiday,other\n"
               "Emails:\n" + digest[:5000] + "\nONLY JSON array.")
 
-    client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+    import anthropic as ant
+    client = ant.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
     resp   = client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=2048,
              messages=[{"role": "user", "content": prompt}])
     raw    = re.sub(r"^```json\s*", "", resp.content[0].text.strip())
@@ -318,12 +312,11 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
         _insert_event(user_id, child, etype, edate, ev.get("event_time"), ev.get("notes"))
         new += 1
 
-    return {"new": new, "skipped": skipped, "emails_scanned": len(emails), "error": None}
+    return {"new": new, "skipped": skipped, "emails_scanned": len(emails_data), "error": None}
 
 
 @app.post("/gmail/scan")
 def gmail_scan(user_id: str):
-    """Scan primary Gmail account."""
     emails = _list_connected_emails(user_id)
     if not emails:
         return {"new": 0, "skipped": 0, "error": "No Gmail accounts connected"}
@@ -332,16 +325,14 @@ def gmail_scan(user_id: str):
 
 @app.post("/gmail/scan-all")
 def gmail_scan_all(user_id: str):
-    """Scan ALL connected Gmail accounts for this user."""
     emails = _list_connected_emails(user_id)
     if not emails:
-        return {"new": 0, "skipped": 0, "accounts_scanned": 0,
-                "error": "No Gmail accounts connected"}
+        return {"new": 0, "skipped": 0, "accounts_scanned": 0, "error": "No accounts"}
     total_new = total_skipped = 0
     for email in emails:
-        result = _scan_single_gmail(user_id, email)
-        total_new     += result.get("new", 0)
-        total_skipped += result.get("skipped", 0)
+        r = _scan_single_gmail(user_id, email)
+        total_new     += r.get("new", 0)
+        total_skipped += r.get("skipped", 0)
     return {"new": total_new, "skipped": total_skipped,
             "accounts_scanned": len(emails), "error": None}
 
@@ -449,8 +440,7 @@ def save_profile(req: ProfileRequest):
 @app.get("/debug/token")
 def debug_token(user_id: str):
     emails = _list_connected_emails(user_id)
-    return {"connected_emails": emails,
-            "token_dir": _token_dir(user_id)}
+    return {"connected_emails": emails, "token_dir": _token_dir(user_id)}
 
 
 if __name__ == "__main__":
