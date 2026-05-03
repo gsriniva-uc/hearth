@@ -38,3 +38,4 @@ pydantic==2.6.4
 dateparser==1.2.0
 httpx
 httpx
+google-cloud-speech==2.27.0
