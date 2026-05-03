@@ -74,7 +74,7 @@ def _save_token(user_id: str, email: str, token_data: dict):
 
 def _load_token(user_id: str, email: str) -> dict | None:
     safe = _safe_email(email)
-    path = os.path.join(_token_dir(user_id), f"gmail_{safe_email}.json")
+    path = os.path.join(_token_dir(user_id), f"gmail_{safe}.json")
     if not os.path.exists(path):
         return None
     with open(path) as f:
