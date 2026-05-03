@@ -232,10 +232,17 @@ def get_speech_token(user_id: str):
     emails = _list_connected_emails(user_id)
     if not emails:
         return {"token": None, "error": "Not authenticated"}
+    # Load raw token data to check expiry
+    token_data = _load_token(user_id, emails[0])
+    if not token_data:
+        return {"token": None, "error": "No token file found"}
+    # Check scopes in stored token
+    scope = token_data.get("scope", "no scope field")
+    expires_in = token_data.get("expires_in", "unknown")
     token = _get_fresh_token(user_id, emails[0])
     if not token:
         return {"token": None, "error": "Could not refresh token"}
-    return {"token": token, "error": None}
+    return {"token": token, "scope": scope, "error": None}
 
 
 # ── Gmail scan ────────────────────────────────────────────────────────────────
