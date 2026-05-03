@@ -3,7 +3,7 @@ main.py — Hearth FastAPI entry point
 """
 
 import os, json, hashlib, datetime, threading, re, base64
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, HTMLResponse
 from pydantic import BaseModel
@@ -460,6 +460,66 @@ def debug_token(user_id: str):
     emails = _list_connected_emails(user_id)
     return {"connected_emails": emails, "token_dir": _token_dir(user_id)}
 
+
+
+
+@app.post("/transcribe")
+async def transcribe_audio(user_id: str, request: Request):
+    """
+    Receive raw audio bytes from app, transcribe using Google Speech-to-Text SDK.
+    SDK handles format detection automatically.
+    """
+    import tempfile
+    from google.cloud import speech
+    from google.oauth2 import service_account
+
+    try:
+        # Get audio bytes from request body
+        audio_bytes = await request.body()
+        if not audio_bytes:
+            return {"transcript": "", "error": "No audio received"}
+
+        # Load service account from env var
+        sa_json = os.getenv("GOOGLE_SPEECH_SA", "")
+        if not sa_json:
+            return {"transcript": "", "error": "Speech service account not configured"}
+
+        sa_info = json.loads(sa_json)
+        creds   = service_account.Credentials.from_service_account_info(
+            sa_info,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+
+        # Write audio to temp file so SDK can read it
+        with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+
+        # Transcribe using SDK
+        client = speech.SpeechClient(credentials=creds)
+        with open(tmp_path, "rb") as f:
+            content_bytes = f.read()
+
+        # Clean up temp file
+        os.unlink(tmp_path)
+
+        audio  = speech.RecognitionAudio(content=content_bytes)
+        config = speech.RecognitionConfig(
+            language_code="en-US",
+            enable_automatic_punctuation=True,
+            model="default",
+        )
+
+        response   = client.recognize(config=config, audio=audio)
+        transcript = ""
+        for result in response.results:
+            transcript += result.alternatives[0].transcript + " "
+
+        transcript = transcript.strip()
+        return {"transcript": transcript, "error": None}
+
+    except Exception as e:
+        return {"transcript": "", "error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
