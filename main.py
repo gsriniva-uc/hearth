@@ -62,14 +62,18 @@ def _token_dir(user_id: str) -> str:
     os.makedirs(d, exist_ok=True)
     return d
 
+def _safe_email(email: str) -> str:
+    """Convert email to safe filename: foo.bar@gmail.com -> foo_bar_at_gmail_com"""
+    return email.replace(".", "_").replace("@", "_at_")
+
 def _save_token(user_id: str, email: str, token_data: dict):
-    safe_email = email.replace("@", "_at_").replace(".", "_")
-    path = os.path.join(_token_dir(user_id), f"gmail_{safe_email}.json")
+    safe = _safe_email(email)
+    path = os.path.join(_token_dir(user_id), f"gmail_{safe}.json")
     with open(path, "w") as f:
         json.dump(token_data, f)
 
 def _load_token(user_id: str, email: str) -> dict | None:
-    safe_email = email.replace("@", "_at_").replace(".", "_")
+    safe = _safe_email(email)
     path = os.path.join(_token_dir(user_id), f"gmail_{safe_email}.json")
     if not os.path.exists(path):
         return None
@@ -81,8 +85,12 @@ def _list_connected_emails(user_id: str) -> list[str]:
     emails = []
     for fname in os.listdir(d):
         if fname.startswith("gmail_") and fname.endswith(".json"):
-            safe  = fname[6:-5]
-            email = safe.replace("_at_", "@").replace("_", ".", 1)
+            safe  = fname[6:-5]  # strip gmail_ and .json
+            # Reverse: foo_bar_at_gmail_com -> foo.bar@gmail.com
+            email = safe.replace("_at_", "@", 1)
+            # Restore dots: split on @ and replace _ with . in each part
+            parts = email.split("@")
+            email = "@".join(p.replace("_", ".") for p in parts)
             emails.append(email)
     return emails
 
