@@ -229,21 +229,23 @@ def register_user(req: dict):
 
 @app.get("/auth/speech-token")
 def get_speech_token(user_id: str):
-    """Return a valid Google access token for Speech-to-Text API calls from the app."""
-    emails = _list_connected_emails(user_id)
-    if not emails:
-        return {"token": None, "error": "Not authenticated"}
-    # Load raw token data to check expiry
-    token_data = _load_token(user_id, emails[0])
-    if not token_data:
-        return {"token": None, "error": "No token file found"}
-    # Check scopes in stored token
-    scope = token_data.get("scope", "no scope field")
-    expires_in = token_data.get("expires_in", "unknown")
-    token = _get_fresh_token(user_id, emails[0])
-    if not token:
-        return {"token": None, "error": "Could not refresh token"}
-    return {"token": token, "scope": scope, "error": None}
+    """Return a service account token for Speech-to-Text API calls from the app."""
+    try:
+        import json as _json
+        from google.oauth2 import service_account
+        sa_json = os.getenv("GOOGLE_SPEECH_SA", "")
+        if not sa_json:
+            return {"token": None, "error": "Service account not configured"}
+        sa_info = _json.loads(sa_json)
+        creds = service_account.Credentials.from_service_account_info(
+            sa_info,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        from google.auth.transport.requests import Request as GRequest
+        creds.refresh(GRequest())
+        return {"token": creds.token, "error": None}
+    except Exception as e:
+        return {"token": None, "error": str(e)}
 
 
 # ── Gmail scan ────────────────────────────────────────────────────────────────
