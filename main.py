@@ -521,6 +521,17 @@ async def transcribe_audio(user_id: str, request: Request):
     except Exception as e:
         return {"transcript": "", "error": str(e)}
 
+
+@app.get("/debug/ffmpeg")
+def debug_ffmpeg():
+    import subprocess
+    try:
+        result = subprocess.run(["ffmpeg", "-version"], 
+                              capture_output=True, text=True, timeout=5)
+        return {"available": True, "version": result.stdout.split("\n")[0]}
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=cfg.API_PORT, reload=True)
