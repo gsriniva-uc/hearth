@@ -490,21 +490,13 @@ async def transcribe_audio(user_id: str, request: Request):
             scopes=["https://www.googleapis.com/auth/cloud-platform"]
         )
 
-        # Write audio to temp file so SDK can read it
-        with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as tmp:
-            tmp.write(audio_bytes)
-            tmp_path = tmp.name
-
         # Transcribe using SDK
         client = speech.SpeechClient(credentials=creds)
-        with open(tmp_path, "rb") as f:
-            content_bytes = f.read()
 
-        # Clean up temp file
-        os.unlink(tmp_path)
-
-        audio  = speech.RecognitionAudio(content=content_bytes)
+        audio  = speech.RecognitionAudio(content=audio_bytes)
         config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.FLAC,
+            sample_rate_hertz=16000,
             language_code="en-US",
             enable_automatic_punctuation=True,
             model="default",
