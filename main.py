@@ -135,6 +135,7 @@ def google_login(user_id: str = "", add_account: bool = False):
         "&scope=" + scope +
         "&access_type=offline"
         "&prompt=consent"
+        "&include_granted_scopes=false"
         "&state=" + urllib.parse.quote(state)
     )
     return RedirectResponse(url)
