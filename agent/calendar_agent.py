@@ -58,20 +58,26 @@ def _insert_event(user_id, child_name, event_type, event_date,
         return cur.lastrowid
 
 def _query_upcoming(user_id: str, days_ahead=14) -> list:
-    today  = date.today().isoformat()
-    cutoff = (date.today()+timedelta(days=days_ahead)).isoformat()
+    today    = date.today().isoformat()
+    cutoff   = (date.today()+timedelta(days=days_ahead)).isoformat()
+    now_time = datetime.now().strftime("%H:%M")
     with _conn() as c:
         rows = c.execute(
             "SELECT * FROM events WHERE user_id=? AND event_date BETWEEN ? AND ?"
-            " ORDER BY event_date",
-            (user_id, today, cutoff)).fetchall()
+            " AND (event_date > ? OR event_time IS NULL OR event_time >= ?)"
+            " ORDER BY event_date, event_time",
+            (user_id, today, cutoff, today, now_time)).fetchall()
     return [dict(r) for r in rows]
 
 def _query_today(user_id: str) -> list:
+    today    = date.today().isoformat()
+    now_time = datetime.now().strftime("%H:%M")
     with _conn() as c:
         rows = c.execute(
-            "SELECT * FROM events WHERE user_id=? AND event_date=? ORDER BY event_time",
-            (user_id, date.today().isoformat())).fetchall()
+            "SELECT * FROM events WHERE user_id=? AND event_date=?"
+            " AND (event_time IS NULL OR event_time >= ?)"
+            " ORDER BY event_time",
+            (user_id, today, now_time)).fetchall()
     return [dict(r) for r in rows]
 
 def _delete_event(user_id: str, event_id: int) -> bool:
