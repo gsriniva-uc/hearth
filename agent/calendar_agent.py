@@ -152,8 +152,18 @@ def _parse_intent(text, input_type, extracted_events) -> dict:
     children_str = ", ".join(cfg.CHILDREN) or "the children"
     prompt = f"""Hearth calendar. Today: {today_str}. Children: {children_str}.
 Valid event_type: {", ".join(EVENT_TYPES)}.
+Event type rules:
+- sports_game: any sport, class, or physical activity (swimming, gymnastics, soccer, dance, karate)
+- school_holiday: no school days, holidays
+- early_dismissal: early pickup, early release
+- dress_down_day: casual day, no uniform
+- recital: performance, concert, show
+- doctor_appointment: medical, dentist, therapy
+- special_day: picture day, field trip, spirit day — always include what it is in notes
+- other: anything that doesn't fit above
+
 User: "{text}" (type: {input_type})
-Return JSON: {{"action":"add"|"delete"|"query","events":[{{"child_name":"...","event_type":"...","event_date":"YYYY-MM-DD","event_time":"HH:MM|null","notes":"...|null"}}],"delete_id":null,"query_window_days":7}}
+Return JSON: {{"action":"add"|"delete"|"query","events":[{{"child_name":"...","event_type":"...","event_date":"YYYY-MM-DD","event_time":"HH:MM|null","notes":"brief description"}}],"delete_id":null,"query_window_days":7}}
 ONLY JSON."""
     resp = _client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=512,
         messages=[{"role":"user","content":prompt}])
@@ -178,7 +188,13 @@ def calendar_agent(state: HearthState) -> HearthState:
                                     ev.get("event_time"), ev.get("notes"))
                 confirmed.append({**ev,"id":eid})
                 label = ev.get("event_type","event").replace("_"," ").title()
-                lines.append(f"✅ **{label}** for {ev.get('child_name','all')} on {ev['event_date']}"
+                from datetime import datetime
+                try:
+                    d = datetime.strptime(ev["event_date"], "%Y-%m-%d")
+                    date_fmt = d.strftime("%m/%d/%y")
+                except:
+                    date_fmt = ev["event_date"]
+                lines.append(f"✅ **{label}** for {ev.get('child_name','all')} on {date_fmt}"
                              + (f" at {ev['event_time']}" if ev.get("event_time") else ""))
                 _sync_to_gcal(user_id, eid, ev.get("child_name","all"),
                               ev.get("event_type","other"), ev["event_date"],
@@ -204,7 +220,14 @@ def calendar_agent(state: HearthState) -> HearthState:
             for r in rows:
                 label    = r["event_type"].replace("_"," ").title()
                 time_str = f" at {r['event_time']}" if r.get("event_time") else ""
-                lines.append(f"• **{r['child_name']}** — {label} on {r['event_date']}{time_str}")
+                from datetime import datetime
+                try:
+                    d = datetime.strptime(r["event_date"], "%Y-%m-%d")
+                    date_fmt = d.strftime("%m/%d/%y")
+                except:
+                    date_fmt = r["event_date"]
+                notes_str = f" ({r['notes']})" if r.get("notes") else ""
+                lines.append(f"• **{r['child_name']}** — {label} on {date_fmt}{time_str}{notes_str}")
 
     return {**state, "confirmed_events":confirmed,
             "response":"\n".join(lines) or "Done.",
