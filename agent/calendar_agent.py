@@ -148,33 +148,62 @@ def _sync_to_outlook(user_id, event_id, child_name, event_type,
 def _parse_intent(text, input_type, extracted_events) -> dict:
     if extracted_events:
         return {"action":"add","events":extracted_events,"query_window_days":7}
+
     today_str    = date.today().strftime("%A, %B %d, %Y")
+    today_iso    = date.today().isoformat()
+    tomorrow_iso = (date.today()+timedelta(days=1)).isoformat()
     children_str = ", ".join(cfg.CHILDREN) or "the children"
-    from datetime import date as _date
-    today_iso  = _date.today().isoformat()
-    tomorrow_iso = (_date.today()+timedelta(days=1)).isoformat()
+
+    # Deterministic pre-check before hitting LLM
+    text_lower = text.lower().strip()
+    if text_lower.startswith("delete") or text_lower.startswith("remove"):
+        # Extract event ID if present
+        import re
+        match = re.search(r"\d+", text_lower)
+        delete_id = int(match.group()) if match else None
+        return {"action":"delete","events":[],"delete_id":delete_id,"query_window_days":7}
+
+    add_keywords = ["add ","adding ","schedule ","create ","put ","set up ",
+                    "class","appointment","game","practice","lesson","session",
+                    "swimming","gymnastics","soccer","dance","karate","piano",
+                    "recital","dentist","doctor","therapy"]
+    is_add = any(kw in text_lower for kw in add_keywords)
+    if is_add:
+        input_type = "manual"
+
     prompt = f"""Hearth calendar. Today: {today_str} ({today_iso}). Children: {children_str}.
 "today" = {today_iso}, "tomorrow" = {tomorrow_iso}.
-If user says "today" resolve it to {today_iso}.
-If input starts with "add" or contains "class","appointment","game","practice" it is an ADD action.
+Resolve relative dates: "today"={today_iso}, "tomorrow"={tomorrow_iso}, "this Tuesday" etc.
+
 Valid event_type: {", ".join(EVENT_TYPES)}.
 Event type rules:
-- sports_game: any sport, class, or physical activity (swimming, gymnastics, soccer, dance, karate)
-- school_holiday: no school days, holidays
-- early_dismissal: early pickup, early release
+- sports_game: ANY sport, physical activity or class (swimming, gymnastics, soccer, dance, karate, tennis, baseball)
+- school_holiday: no school, holiday
+- early_dismissal: early pickup/release
 - dress_down_day: casual day, no uniform
 - recital: performance, concert, show
 - doctor_appointment: medical, dentist, therapy
 - special_day: picture day, field trip, spirit day — always include what it is in notes
-- other: anything that doesn't fit above
+- other: ONLY if nothing else fits
 
-User: "{text}" (type: {input_type})
-Return JSON: {{"action":"add"|"delete"|"query","events":[{{"child_name":"...","event_type":"...","event_date":"YYYY-MM-DD","event_time":"HH:MM|null","notes":"brief description"}}],"delete_id":null,"query_window_days":7}}
-ONLY JSON."""
+User input: "{text}"
+Input type: {input_type}
+
+{"This looks like an ADD request — respond with action=add." if is_add else ""}
+
+Return ONLY this JSON:
+{{"action":"add"|"delete"|"query","events":[{{"child_name":"...","event_type":"...","event_date":"YYYY-MM-DD","event_time":"HH:MM|null","notes":"brief description"}}],"delete_id":null,"query_window_days":7}}"""
+
     resp = _client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=512,
         messages=[{"role":"user","content":prompt}])
-    try: return json.loads(resp.content[0].text.strip())
-    except: return {"action":"query","events":[],"query_window_days":7}
+    raw = resp.content[0].text.strip()
+    import re as _re
+    raw = _re.sub(r"^```json\s*","",raw)
+    raw = _re.sub(r"\s*```$","",raw)
+    try:
+        return json.loads(raw)
+    except:
+        return {"action":"query","events":[],"query_window_days":7}
 
 # ── Main node ───────────────────────────────────────────────────────────────────
 
