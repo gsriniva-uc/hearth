@@ -5,7 +5,7 @@ All queries scoped by user_id.
 Schema includes user_id column (added via db_migrate.py).
 """
 import json, sqlite3, os
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 import anthropic
 import hearth_config as cfg
 from agent.state import HearthState
