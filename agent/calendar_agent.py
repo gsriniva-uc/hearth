@@ -12,7 +12,7 @@ from agent.state import HearthState
 
 EVENT_TYPES = [
     "dress_down_day","early_dismissal","recital","movie_night","field_trip",
-    "special_day","doctor_appointment","sports_game","school_holiday","other",
+    "special_day","doctor_appointment","sports_game","school_holiday","activity","other",
 ]
 _client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
 
@@ -177,11 +177,12 @@ Resolve relative dates: "today"={today_iso}, "tomorrow"={tomorrow_iso}, "this Tu
 
 Valid event_type: {", ".join(EVENT_TYPES)}.
 Event type rules:
-- sports_game: ANY sport, physical activity or class (swimming, gymnastics, soccer, dance, karate, tennis, baseball)
+- sports_game: physical sports (swimming, gymnastics, soccer, dance, karate, tennis, baseball)
+- activity: non-sport classes (piano, art, tutoring, coding, music, drama)
+- recital: performances, concerts, shows only
 - school_holiday: no school, holiday
 - early_dismissal: early pickup/release
 - dress_down_day: casual day, no uniform
-- recital: performance, concert, show
 - doctor_appointment: medical, dentist, therapy
 - special_day: picture day, field trip, spirit day — always include what it is in notes
 - other: ONLY if nothing else fits
