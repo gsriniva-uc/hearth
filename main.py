@@ -466,34 +466,63 @@ def debug_token(user_id: str):
 @app.post("/transcribe")
 async def transcribe_audio(user_id: str, request: Request):
     """
-    Receive raw audio bytes from app, transcribe using Google Speech-to-Text SDK.
-    SDK handles format detection automatically.
+    Receive base64 M4A audio from app.
+    Convert M4A to FLAC using ffmpeg.
+    Transcribe using Google Speech-to-Text SDK with service account.
     """
-    import tempfile
+    import tempfile, subprocess
     from google.cloud import speech
     from google.oauth2 import service_account
 
     try:
-        # Get audio bytes from request body
-        audio_bytes = await request.body()
-        if not audio_bytes:
+        # Parse JSON body with base64 audio
+        body      = await request.json()
+        audio_b64 = body.get("audio", "")
+        if not audio_b64:
             return {"transcript": "", "error": "No audio received"}
 
-        # Load service account from env var
+        # Decode base64 to M4A bytes
+        m4a_bytes = base64.b64decode(audio_b64)
+        print(f"[transcribe] received {len(m4a_bytes)} bytes M4A")
+
+        # Write M4A to temp file
+        with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as tmp:
+            tmp.write(m4a_bytes)
+            m4a_path = tmp.name
+
+        # Convert M4A to FLAC using ffmpeg
+        flac_path = m4a_path.replace(".m4a", ".flac")
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", m4a_path,
+             "-ar", "16000", "-ac", "1", "-c:a", "flac", flac_path],
+            capture_output=True, text=True, timeout=30
+        )
+
+        # Clean up M4A
+        os.unlink(m4a_path)
+
+        if result.returncode != 0:
+            print(f"[transcribe] ffmpeg error: {result.stderr[-200:]}")
+            return {"transcript": "", "error": "Audio conversion failed"}
+
+        with open(flac_path, "rb") as f:
+            flac_bytes = f.read()
+        os.unlink(flac_path)
+        print(f"[transcribe] converted to {len(flac_bytes)} bytes FLAC")
+
+        # Load service account
         sa_json = os.getenv("GOOGLE_SPEECH_SA", "")
         if not sa_json:
             return {"transcript": "", "error": "Speech service account not configured"}
-
         sa_info = json.loads(sa_json)
         creds   = service_account.Credentials.from_service_account_info(
             sa_info,
             scopes=["https://www.googleapis.com/auth/cloud-platform"]
         )
 
-        # Transcribe using SDK
+        # Transcribe
         client = speech.SpeechClient(credentials=creds)
-
-        audio  = speech.RecognitionAudio(content=audio_bytes)
+        audio  = speech.RecognitionAudio(content=flac_bytes)
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.FLAC,
             sample_rate_hertz=16000,
@@ -501,16 +530,15 @@ async def transcribe_audio(user_id: str, request: Request):
             enable_automatic_punctuation=True,
             model="default",
         )
-
         response   = client.recognize(config=config, audio=audio)
-        transcript = ""
-        for result in response.results:
-            transcript += result.alternatives[0].transcript + " "
-
-        transcript = transcript.strip()
+        transcript = " ".join(
+            r.alternatives[0].transcript for r in response.results
+        ).strip()
+        print(f"[transcribe] transcript: '{transcript}'")
         return {"transcript": transcript, "error": None}
 
     except Exception as e:
+        print(f"[transcribe] exception: {e}")
         return {"transcript": "", "error": str(e)}
 
 
