@@ -229,8 +229,9 @@ def calendar_agent(state: HearthState) -> HearthState:
                     date_fmt = d.strftime("%m/%d/%y")
                 except:
                     date_fmt = ev["event_date"]
-                lines.append(f"✅ **{label}** for {ev.get('child_name','all')} on {date_fmt}"
-                             + (f" at {ev['event_time']}" if ev.get("event_time") else ""))
+                notes_label = ev.get("notes") or label
+                time_str    = f" at {ev['event_time']}" if ev.get("event_time") else ""
+                lines.append(f"✅ {ev.get('child_name','all')} — {notes_label} on {date_fmt}{time_str}")
                 _sync_to_gcal(user_id, eid, ev.get("child_name","all"),
                               ev.get("event_type","other"), ev["event_date"],
                               ev.get("event_time"), ev.get("notes"))
