@@ -150,10 +150,11 @@ def _parse_intent(text, input_type, extracted_events) -> dict:
         return {"action":"add","events":extracted_events,"query_window_days":7}
     today_str    = date.today().strftime("%A, %B %d, %Y")
     children_str = ", ".join(cfg.CHILDREN) or "the children"
-    from datetime import date
-    today_iso = date.today().isoformat()
+    from datetime import date as _date
+    today_iso  = _date.today().isoformat()
+    tomorrow_iso = (_date.today()+timedelta(days=1)).isoformat()
     prompt = f"""Hearth calendar. Today: {today_str} ({today_iso}). Children: {children_str}.
-"today" = {today_iso}, "tomorrow" = {(date.today()+timedelta(days=1)).isoformat()}.
+"today" = {today_iso}, "tomorrow" = {tomorrow_iso}.
 If user says "today" resolve it to {today_iso}.
 If input starts with "add" or contains "class","appointment","game","practice" it is an ADD action.
 Valid event_type: {", ".join(EVENT_TYPES)}.
