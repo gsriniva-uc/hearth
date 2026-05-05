@@ -199,17 +199,23 @@ async def google_callback(code: str, state: str = "{}"):
     token_val = up.quote(token_data["access_token"])
     deep_link = APP_SCHEME + "://auth?user=" + user_json + "&token=" + token_val
     name      = user_record.get("name", "there")
-    msg       = "Gmail account added!" if add_account else "Signed in to Hearth successfully."
+    msg       = "Gmail account added!" if add_account else "Signed in successfully!"
+    code      = _generate_auth_code(user_record)
 
     html  = "<html><head>"
     html += "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     html += "<script>setTimeout(function(){window.location.href='" + deep_link + "';},800);</script>"
-    html += "<style>body{font-family:sans-serif;text-align:center;padding:40px;background:#FFF8F0;color:#8B4513}"
-    html += "a{background:#E8734A;color:white;padding:16px 32px;border-radius:12px;text-decoration:none;font-size:18px;font-weight:bold}"
+    html += "<style>"
+    html += "body{font-family:sans-serif;text-align:center;padding:40px;background:#FFF8F0;color:#8B4513}"
+    html += "a{background:#E8734A;color:white;padding:16px 32px;border-radius:12px;text-decoration:none;font-size:18px;font-weight:bold;display:block;margin:16px auto;max-width:200px}"
+    html += ".code{font-size:48px;font-weight:900;letter-spacing:12px;color:#E8734A;margin:24px 0;padding:20px;background:#fff;border-radius:16px;border:3px solid #E8734A}"
     html += "</style></head><body>"
     html += "<h1>&#127968;</h1><h2>Welcome, " + name + "!</h2>"
     html += "<p>" + msg + "</p>"
     html += "<a href='" + deep_link + "'>Open Hearth App</a>"
+    html += "<p style='margin-top:24px;color:#A0856B'>If the app doesn't open, enter this code in Hearth:</p>"
+    html += "<div class='code'>" + code + "</div>"
+    html += "<p style='font-size:12px;color:#A0856B'>Code expires after one use</p>"
     html += "</body></html>"
     return HTMLResponse(html)
 
@@ -551,6 +557,25 @@ def debug_ffmpeg():
         return {"available": True, "version": result.stdout.split("\n")[0]}
     except Exception as e:
         return {"available": False, "error": str(e)}
+
+
+import random, string
+
+# In-memory code store {code: user_record}
+_auth_codes: dict = {}
+
+def _generate_auth_code(user_record: dict) -> str:
+    code = "".join(random.choices(string.digits, k=6))
+    _auth_codes[code] = user_record
+    return code
+
+@app.get("/auth/code")
+def get_user_by_code(code: str):
+    user_record = _auth_codes.get(code)
+    if not user_record:
+        return {"user": None, "error": "Invalid or expired code"}
+    del _auth_codes[code]  # one-time use
+    return {"user": user_record, "error": None}
 
 if __name__ == "__main__":
     import uvicorn
