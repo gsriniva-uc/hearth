@@ -260,14 +260,27 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
     from googleapiclient.discovery import build
     from datetime import date, timedelta
     import anthropic
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
 
-    token = _get_fresh_token(user_id, email)
-    if not token:
+    token_data = _load_token(user_id, email)
+    if not token_data:
         return {"new": 0, "skipped": 0, "emails_scanned": 0,
                 "error": f"Not authenticated: {email}"}
 
-    from google.oauth2.credentials import Credentials
-    creds   = Credentials(token=token)
+    creds = Credentials(
+        token=token_data.get("access_token"),
+        refresh_token=token_data.get("refresh_token"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+    )
+    if not creds.valid and creds.refresh_token:
+        creds.refresh(Request())
+        token_data["access_token"] = creds.token
+        _save_token(user_id, email, token_data)
+
     service = build("gmail", "v1", credentials=creds)
     after   = (date.today() - timedelta(days=14)).strftime("%Y/%m/%d")
     query   = ("(subject:(dismissal OR recital OR newsletter OR \"no school\" "
