@@ -586,6 +586,34 @@ def debug_token_keys(user_id: str, email: str):
     return {"exists": True, "keys": list(token_data.keys()),
             "has_refresh": "refresh_token" in token_data}
 
+
+@app.get("/debug/test-refresh")
+def debug_test_refresh(user_id: str, email: str):
+    try:
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        token_data = _load_token(user_id, email)
+        if not token_data:
+            return {"error": "No token found"}
+        creds = Credentials(
+            token=token_data.get("access_token"),
+            refresh_token=token_data.get("refresh_token"),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            scopes=GMAIL_SCOPES,
+        )
+        return {
+            "valid": creds.valid,
+            "has_refresh": bool(creds.refresh_token),
+            "has_client_id": bool(creds.client_id),
+            "has_client_secret": bool(creds.client_secret),
+            "client_id_preview": GOOGLE_CLIENT_ID[:20],
+            "client_secret_set": bool(GOOGLE_CLIENT_SECRET),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=cfg.API_PORT, reload=True)
