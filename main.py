@@ -285,7 +285,10 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
     after   = (date.today() - timedelta(days=14)).strftime("%Y/%m/%d")
     query   = ("(subject:(dismissal OR recital OR newsletter OR \"no school\" "
                "OR \"dress down\" OR \"field trip\" OR \"early release\" "
-               "OR \"school holiday\" OR \"picture day\")) after:" + after)
+               "OR \"school holiday\" OR \"picture day\" OR \"early dismissal\" "
+               "OR \"school closure\" OR \"parent teacher\" OR \"conferences\" "
+               "OR \"sign up\" OR \"special event\" OR rock OR climbing OR tumbling "
+               "OR cheerleading OR karate OR piano OR music OR \"after school\")) after:" + after)
     result  = service.users().messages().list(
         userId="me", q=query, maxResults=50).execute()
     messages = result.get("messages", [])
