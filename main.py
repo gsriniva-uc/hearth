@@ -577,6 +577,15 @@ def get_user_by_code(code: str):
     del _auth_codes[code]  # one-time use
     return {"user": user_record, "error": None}
 
+
+@app.get("/debug/token-keys")
+def debug_token_keys(user_id: str, email: str):
+    token_data = _load_token(user_id, email)
+    if not token_data:
+        return {"exists": False}
+    return {"exists": True, "keys": list(token_data.keys()),
+            "has_refresh": "refresh_token" in token_data}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=cfg.API_PORT, reload=True)
