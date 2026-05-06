@@ -183,8 +183,8 @@ Resolve relative dates: "today"={today_iso}, "tomorrow"={tomorrow_iso}, "this Tu
 
 Valid event_type: {", ".join(EVENT_TYPES)}.
 Event type rules:
-- sports_game: physical sports (swimming, gymnastics, soccer, dance, karate, tennis, baseball)
-- activity: non-sport classes (piano, art, tutoring, coding, music, drama)
+- sports_game: physical sports (swimming, gymnastics, soccer, dance, karate, tennis, baseball, rock climbing, tumbling, cheerleading)
+- activity: non-sport classes (piano, art, tutoring, coding, music, drama, rock climbing, tumbling, cheerleading)
 - recital: performances, concerts, shows only
 - school_holiday: no school, holiday
 - early_dismissal: early pickup/release
