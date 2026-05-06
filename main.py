@@ -630,6 +630,51 @@ def debug_test_refresh(user_id: str, email: str):
     except Exception as e:
         return {"error": str(e)}
 
+
+@app.post("/gmail/scan-debug")
+async def gmail_scan_debug(user_id: str):
+    """Scan and return raw email subjects for debugging."""
+    from googleapiclient.discovery import build
+    from datetime import date, timedelta
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+
+    emails_found = _list_connected_emails(user_id)
+    if not emails_found:
+        return {"error": "No Gmail connected"}
+
+    email = emails_found[0]
+    token_data = _load_token(user_id, email)
+    creds = Credentials(
+        token=token_data.get("access_token"),
+        refresh_token=token_data.get("refresh_token"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+    )
+    if not creds.valid and creds.refresh_token:
+        creds.refresh(Request())
+
+    service = build("gmail", "v1", credentials=creds)
+    after   = (date.today() - timedelta(days=30)).strftime("%Y/%m/%d")
+    query   = ("(subject:(dismissal OR recital OR newsletter OR \"no school\" "
+               "OR \"dress down\" OR \"field trip\" OR \"early release\" "
+               "OR \"school holiday\" OR \"picture day\" OR \"early dismissal\" "
+               "OR \"school closure\" OR \"parent teacher\" OR \"sign up\" "
+               "OR \"special event\" OR rock OR climbing OR tumbling "
+               "OR cheerleading OR karate OR piano OR music OR \"after school\")) after:" + after)
+    result   = service.users().messages().list(userId="me", q=query, maxResults=20).execute()
+    messages = result.get("messages", [])
+    subjects = []
+    for msg in messages[:10]:
+        full    = service.users().messages().get(userId="me", id=msg["id"], format="metadata",
+                  metadataHeaders=["Subject"]).execute()
+        subject = next((h["value"] for h in full["payload"].get("headers", [])
+                       if h["name"] == "Subject"), "no subject")
+        subjects.append(subject)
+    return {"emails_found": len(messages), "subjects": subjects}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=cfg.API_PORT, reload=True)
