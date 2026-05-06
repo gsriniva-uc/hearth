@@ -245,6 +245,20 @@ def calendar_agent(state: HearthState) -> HearthState:
                 _sync_to_outlook(user_id, eid, ev.get("child_name","all"),
                                  ev.get("event_type","other"), ev["event_date"],
                                  ev.get("event_time"), ev.get("notes"))
+                # Write to Google Calendar
+                try:
+                    from main import _write_to_gcal, _list_connected_emails
+                    emails = _list_connected_emails(user_id)
+                    if emails:
+                        summary = ev.get("notes") or ev.get("event_type","event").replace("_"," ").title()
+                        child   = ev.get("child_name","")
+                        if child and child != "all":
+                            summary = f"{child} - {summary}"
+                        _write_to_gcal(user_id, emails[0], summary,
+                                      ev["event_date"], ev.get("event_time"),
+                                      ev.get("notes"))
+                except Exception as e:
+                    print(f"[gcal write] {e}")
             except Exception as e:
                 lines.append(f"⚠️ Could not add: {e}")
 

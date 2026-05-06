@@ -283,12 +283,19 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
 
     service = build("gmail", "v1", credentials=creds)
     after   = (date.today() - timedelta(days=14)).strftime("%Y/%m/%d")
-    query   = ("(subject:(dismissal OR recital OR newsletter OR \"no school\" "
-               "OR \"dress down\" OR \"field trip\" OR \"early release\" "
-               "OR \"school holiday\" OR \"picture day\" OR \"early dismissal\" "
-               "OR \"school closure\" OR \"parent teacher\" OR \"conferences\" "
-               "OR \"sign up\" OR \"special event\" OR rock OR climbing OR tumbling "
-               "OR cheerleading OR karate OR piano OR music OR \"after school\")) after:" + after)
+    query   = ("(subject:("
+               "\"early dismissal\" OR \"no school\" OR \"half day\" OR \"field trip\" "
+               "OR \"permission slip\" OR PTA OR \"parent teacher\" OR \"report card\" "
+               "OR \"spirit day\" OR \"dress down\" OR \"dress code\" OR \"school closed\" "
+               "OR \"school closure\" OR recital OR practice OR tryouts OR \"schedule change\" "
+               "OR \"map test\" OR \"special event\" OR \"sign up\" OR newsletter "
+               "OR cheerleading OR tumbling OR climbing OR karate OR piano OR music "
+               "OR appointment OR checkup OR vaccination OR immunization OR dentist "
+               "OR pediatric OR prescription OR refill "
+               "OR \"bill due\" OR \"payment due\" OR invoice OR renewal OR insurance "
+               "OR maintenance OR delivery OR repair OR \"technician visit\" "
+               "OR invitation OR RSVP OR birthday OR party OR celebration "
+               "OR reminder OR deadline OR rescheduled OR cancelled)) after:" + after)
     result  = service.users().messages().list(
         userId="me", q=query, maxResults=50).execute()
     messages = result.get("messages", [])
@@ -674,6 +681,157 @@ async def gmail_scan_debug(user_id: str):
                        if h["name"] == "Subject"), "no subject")
         subjects.append(subject)
     return {"emails_found": len(messages), "subjects": subjects}
+
+
+# ── Google Calendar ────────────────────────────────────────────────────────────
+
+def _get_gcal_service(user_id: str, email: str):
+    from googleapiclient.discovery import build
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    token_data = _load_token(user_id, email)
+    if not token_data:
+        return None
+    creds = Credentials(
+        token=token_data.get("access_token"),
+        refresh_token=token_data.get("refresh_token"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=["https://www.googleapis.com/auth/calendar"],
+    )
+    if not creds.valid and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            token_data["access_token"] = creds.token
+            _save_token(user_id, email, token_data)
+        except Exception as e:
+            print(f"[gcal] refresh failed: {e}")
+            return None
+    return build("calendar", "v3", credentials=creds)
+
+
+def _write_to_gcal(user_id: str, email: str, summary: str,
+                   event_date: str, event_time: str = None,
+                   description: str = None) -> str:
+    from datetime import datetime, timedelta
+    service = _get_gcal_service(user_id, email)
+    if not service:
+        return None
+    if event_time:
+        start_dt = f"{event_date}T{event_time}:00"
+        try:
+            dt  = datetime.fromisoformat(start_dt)
+            end = (dt + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:00")
+        except:
+            end = start_dt
+        start = {"dateTime": start_dt, "timeZone": "America/New_York"}
+        end_t = {"dateTime": end,      "timeZone": "America/New_York"}
+    else:
+        start = {"date": event_date}
+        end_t = {"date": event_date}
+    body = {"summary": summary, "start": start, "end": end_t}
+    if description:
+        body["description"] = description
+    try:
+        result = service.events().insert(calendarId="primary", body=body).execute()
+        return result.get("id")
+    except Exception as e:
+        print(f"[gcal write] {e}")
+        return None
+
+
+def _sync_gcal_to_db(user_id: str, email: str) -> dict:
+    from datetime import datetime, timedelta, timezone
+    service = _get_gcal_service(user_id, email)
+    if not service:
+        return {"new": 0, "error": "Not authenticated"}
+    now    = datetime.now(timezone.utc).isoformat()
+    cutoff = (datetime.now(timezone.utc) + timedelta(days=60)).isoformat()
+    try:
+        result = service.events().list(
+            calendarId="primary", timeMin=now, timeMax=cutoff,
+            maxResults=50, singleEvents=True, orderBy="startTime",
+        ).execute()
+    except Exception as e:
+        return {"new": 0, "error": str(e)}
+    gcal_events = result.get("items", [])
+    new = skipped = 0
+    from agent.calendar_agent import _conn, _event_exists, _insert_event
+    for ev in gcal_events:
+        summary = ev.get("summary", "")
+        if not summary:
+            continue
+        start      = ev.get("start", {})
+        event_date = start.get("date") or start.get("dateTime", "")[:10]
+        event_time = None
+        if "dateTime" in start:
+            try:
+                dt = datetime.fromisoformat(start["dateTime"].replace("Z", "+00:00"))
+                event_time = dt.strftime("%H:%M")
+            except:
+                pass
+        gcal_id = ev.get("id", "")
+        with _conn() as c:
+            exists = c.execute(
+                "SELECT id FROM events WHERE user_id=? AND gcal_event_id=?",
+                (user_id, gcal_id)).fetchone()
+        if exists:
+            skipped += 1
+            continue
+        # Simple keyword classification
+        s = summary.lower()
+        if any(k in s for k in ["doctor","dentist","appointment","checkup","vaccination"]):
+            etype = "doctor_appointment"
+        elif any(k in s for k in ["dismissal","no school","half day","school closed","holiday"]):
+            etype = "early_dismissal"
+        elif any(k in s for k in ["recital","performance","concert","show"]):
+            etype = "recital"
+        elif any(k in s for k in ["field trip","trip"]):
+            etype = "field_trip"
+        elif any(k in s for k in ["swim","gymnastic","karate","soccer","cheer","tumbl","rock climb","sport","practice","game"]):
+            etype = "sports_game"
+        elif any(k in s for k in ["piano","music","art","tutor","drama","activity","class"]):
+            etype = "activity"
+        elif any(k in s for k in ["bill","payment","invoice","due","renewal","insurance"]):
+            etype = "bill"
+        else:
+            etype = "other"
+        # Insert
+        with _conn() as c:
+            c.execute(
+                "INSERT INTO events(user_id,child_name,event_type,event_date,"
+                "event_time,notes,gcal_event_id) VALUES(?,?,?,?,?,?,?)",
+                (user_id, "all", etype, event_date, event_time, summary, gcal_id))
+            c.commit()
+        new += 1
+    return {"new": new, "skipped": skipped, "error": None}
+
+
+@app.post("/gcal/sync")
+def gcal_sync(user_id: str):
+    emails = _list_connected_emails(user_id)
+    if not emails:
+        return {"new": 0, "error": "No Gmail connected"}
+    total_new = 0
+    for email in emails:
+        r = _sync_gcal_to_db(user_id, email)
+        total_new += r.get("new", 0)
+    return {"new": total_new, "error": None}
+
+
+@app.post("/gcal/write")
+def gcal_write(req: dict):
+    user_id    = req.get("user_id", "")
+    summary    = req.get("summary", "")
+    event_date = req.get("event_date", "")
+    event_time = req.get("event_time")
+    emails     = _list_connected_emails(user_id)
+    if not emails or not summary or not event_date:
+        return {"gcal_id": None, "error": "Missing required fields"}
+    gcal_id = _write_to_gcal(emails[0], emails[0], summary, event_date,
+                             event_time, req.get("description"))
+    return {"gcal_id": gcal_id, "error": None if gcal_id else "Write failed"}
 
 if __name__ == "__main__":
     import uvicorn
