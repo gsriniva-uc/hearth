@@ -295,7 +295,11 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
                "OR \"bill due\" OR \"payment due\" OR invoice OR renewal OR insurance "
                "OR maintenance OR delivery OR repair OR \"technician visit\" "
                "OR invitation OR RSVP OR birthday OR party OR celebration "
-               "OR reminder OR deadline OR rescheduled OR cancelled)) after:" + after)
+               "OR reminder OR deadline OR rescheduled OR cancelled "
+               "OR \"art show\" OR artwork OR performance OR showcase OR ceremony "
+               "OR gymnastics OR gymnastic OR \"art class\" OR \"music class\" "
+               "OR \"class schedule\" OR \"school event\" OR \"grade\" "
+               "OR show OR exhibit OR concert OR assembly)) after:" + after)
     result  = service.users().messages().list(
         userId="me", q=query, maxResults=50).execute()
     messages = result.get("messages", [])
@@ -640,7 +644,7 @@ def debug_test_refresh(user_id: str, email: str):
 
 @app.post("/gmail/scan-debug")
 async def gmail_scan_debug(user_id: str):
-    """Scan and return raw email subjects for debugging."""
+    """Scan and return raw email subjects for debugging - all accounts."""
     from googleapiclient.discovery import build
     from datetime import date, timedelta
     from google.oauth2.credentials import Credentials
@@ -650,7 +654,8 @@ async def gmail_scan_debug(user_id: str):
     if not emails_found:
         return {"error": "No Gmail connected"}
 
-    email = emails_found[0]
+    all_subjects = []
+    for email in emails_found:
     token_data = _load_token(user_id, email)
     creds = Credentials(
         token=token_data.get("access_token"),
