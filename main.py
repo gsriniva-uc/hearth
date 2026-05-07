@@ -656,6 +656,38 @@ async def gmail_scan_debug(user_id: str):
 
     all_subjects = []
     for email in emails_found:
+        token_data = _load_token(user_id, email)
+        if not token_data:
+            continue
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        creds = Credentials(
+            token=token_data.get("access_token"),
+            refresh_token=token_data.get("refresh_token"),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+        )
+        if not creds.valid and creds.refresh_token:
+            creds.refresh(Request())
+        from googleapiclient.discovery import build
+        from datetime import date, timedelta
+        service = build("gmail", "v1", credentials=creds)
+        after   = (date.today() - timedelta(days=30)).strftime("%Y/%m/%d")
+        query   = ("(subject:(dismissal OR recital OR newsletter OR show OR "
+                   "artwork OR gymnastics OR cheerleading OR \"art show\" OR "
+                   "\"no school\" OR \"field trip\" OR appointment OR "
+                   "reminder OR performance OR showcase OR assembly)) after:" + after)
+        result   = service.users().messages().list(userId="me", q=query, maxResults=20).execute()
+        messages = result.get("messages", [])
+        for msg in messages[:10]:
+            full    = service.users().messages().get(userId="me", id=msg["id"],
+                      format="metadata", metadataHeaders=["Subject"]).execute()
+            subject = next((h["value"] for h in full["payload"].get("headers", [])
+                           if h["name"] == "Subject"), "no subject")
+            all_subjects.append({"email": email, "subject": subject})
+    return {"emails_found": len(all_subjects), "subjects": all_subjects}
     token_data = _load_token(user_id, email)
     creds = Credentials(
         token=token_data.get("access_token"),
@@ -678,14 +710,7 @@ async def gmail_scan_debug(user_id: str):
                "OR cheerleading OR karate OR piano OR music OR \"after school\")) after:" + after)
     result   = service.users().messages().list(userId="me", q=query, maxResults=20).execute()
     messages = result.get("messages", [])
-    subjects = []
-    for msg in messages[:10]:
-        full    = service.users().messages().get(userId="me", id=msg["id"], format="metadata",
-                  metadataHeaders=["Subject"]).execute()
-        subject = next((h["value"] for h in full["payload"].get("headers", [])
-                       if h["name"] == "Subject"), "no subject")
-        subjects.append(subject)
-    return {"emails_found": len(messages), "subjects": subjects}
+
 
 
 # ── Google Calendar ────────────────────────────────────────────────────────────
