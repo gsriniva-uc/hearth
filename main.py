@@ -324,7 +324,11 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
             subject = next((h["value"] for h in full["payload"].get("headers", [])
                            if h["name"] == "Subject"), "")
             body    = extract_body(full["payload"])
-            if body: emails_data.append({"subject": subject, "body": body[:3000]})
+            # Get email received date
+            date_header = next((h["value"] for h in full["payload"].get("headers", [])
+                               if h["name"] == "Date"), "")
+            if body: emails_data.append({"subject": subject, "body": body[:3000],
+                                         "received": date_header})
         except: continue
 
     if not emails_data:
