@@ -755,6 +755,25 @@ def _get_gcal_service(user_id: str, email: str):
     return build("calendar", "v3", credentials=creds)
 
 
+
+def _gcal_event_exists(service, summary: str, event_date: str) -> bool:
+    """Check if event already exists in Google Calendar on given date."""
+    from datetime import datetime, timezone, timedelta
+    try:
+        day_start = event_date + "T00:00:00Z"
+        day_end   = event_date + "T23:59:59Z"
+        result    = service.events().list(
+            calendarId="primary",
+            timeMin=day_start, timeMax=day_end,
+            q=summary[:30], singleEvents=True
+        ).execute()
+        for ev in result.get("items", []):
+            if summary.lower()[:20] in ev.get("summary","").lower():
+                return True
+    except:
+        pass
+    return False
+
 def _write_to_gcal(user_id: str, email: str, summary: str,
                    event_date: str, event_time: str = None,
                    description: str = None) -> str:
@@ -762,6 +781,10 @@ def _write_to_gcal(user_id: str, email: str, summary: str,
     service = _get_gcal_service(user_id, email)
     if not service:
         return None
+    # Check for duplicate before writing
+    if _gcal_event_exists(service, summary, event_date):
+        print(f"[gcal] duplicate skipped: {summary} on {event_date}")
+        return "duplicate"
     if event_time:
         start_dt = f"{event_date}T{event_time}:00"
         try:
