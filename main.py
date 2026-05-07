@@ -190,6 +190,8 @@ async def google_callback(code: str, state: str = "{}"):
     def bg_scan():
         try:
             _scan_single_gmail(user_id, email)
+            # Also sync Google Calendar
+            _sync_gcal_to_db(user_id, email)
         except Exception as e:
             print(f"[bg scan] {e}")
     threading.Thread(target=bg_scan, daemon=True).start()
