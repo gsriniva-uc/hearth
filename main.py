@@ -469,6 +469,32 @@ class AgentRequest(BaseModel):
 @app.post("/agent")
 def agent_chat(req: AgentRequest):
     result = run(raw_text=req.raw_text, user_id=req.user_id)
+    
+    # Write confirmed events to Google Calendar
+    confirmed = result.get("confirmed_events", [])
+    emails    = _list_connected_emails(req.user_id)
+    if confirmed and emails:
+        for ev in confirmed:
+            try:
+                gcal_summary = ev.get("notes") or ev.get("event_type","event").replace("_"," ").title()
+                child = ev.get("child_name","")
+                if child and child != "all":
+                    gcal_summary = child + " - " + gcal_summary
+                svc = _get_gcal_service(req.user_id, emails[0])
+                if svc and not _gcal_event_exists(svc, gcal_summary, ev["event_date"]):
+                    gcal_id = _write_to_gcal(req.user_id, emails[0], gcal_summary,
+                                             ev["event_date"], ev.get("event_time"),
+                                             ev.get("notes"))
+                    if gcal_id and gcal_id != "duplicate":
+                        from agent.calendar_agent import _conn
+                        with _conn() as c:
+                            c.execute("UPDATE events SET gcal_event_id=? WHERE id=?",
+                                      (gcal_id, ev.get("id")))
+                            c.commit()
+                        print(f"[gcal] wrote: {gcal_summary} on {ev['event_date']}")
+            except Exception as e:
+                print(f"[gcal write in agent endpoint] {e}")
+    
     return {"response": result.get("response", "")}
 
 
