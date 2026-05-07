@@ -245,20 +245,24 @@ def calendar_agent(state: HearthState) -> HearthState:
                 _sync_to_outlook(user_id, eid, ev.get("child_name","all"),
                                  ev.get("event_type","other"), ev["event_date"],
                                  ev.get("event_time"), ev.get("notes"))
-                # Write to Google Calendar
+                # Write to Google Calendar via internal import
                 try:
-                    from main import _write_to_gcal, _list_connected_emails
+                    import sys, os
+                    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+                    from main import _write_to_gcal, _list_connected_emails, _get_gcal_service, _gcal_event_exists
                     emails = _list_connected_emails(user_id)
                     if emails:
-                        summary = ev.get("notes") or ev.get("event_type","event").replace("_"," ").title()
-                        child   = ev.get("child_name","")
+                        gcal_summary = ev.get("notes") or ev.get("event_type","event").replace("_"," ").title()
+                        child = ev.get("child_name","")
                         if child and child != "all":
-                            summary = f"{child} - {summary}"
-                        _write_to_gcal(user_id, emails[0], summary,
-                                      ev["event_date"], ev.get("event_time"),
-                                      ev.get("notes"))
+                            gcal_summary = child + " - " + gcal_summary
+                        svc = _get_gcal_service(user_id, emails[0])
+                        if svc and not _gcal_event_exists(svc, gcal_summary, ev["event_date"]):
+                            _write_to_gcal(user_id, emails[0], gcal_summary,
+                                          ev["event_date"], ev.get("event_time"),
+                                          ev.get("notes"))
                 except Exception as e:
-                    print(f"[gcal write] {e}")
+                    print(f"[gcal write from agent] {e}")
             except Exception as e:
                 lines.append(f"⚠️ Could not add: {e}")
 
