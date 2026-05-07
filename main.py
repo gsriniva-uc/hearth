@@ -702,13 +702,23 @@ async def gmail_scan_debug(user_id: str):
 
     service = build("gmail", "v1", credentials=creds)
     after   = (date.today() - timedelta(days=30)).strftime("%Y/%m/%d")
-    query   = ("(subject:(dismissal OR recital OR newsletter OR \"no school\" "
-               "OR \"dress down\" OR \"field trip\" OR \"early release\" "
-               "OR \"school holiday\" OR \"picture day\" OR \"early dismissal\" "
-               "OR \"school closure\" OR \"parent teacher\" OR \"sign up\" "
-               "OR \"special event\" OR rock OR climbing OR tumbling "
-               "OR cheerleading OR karate OR piano OR music OR \"after school\")) after:" + after)
-    result   = service.users().messages().list(userId="me", q=query, maxResults=20).execute()
+    query   = ("(subject:("
+               "\"early dismissal\" OR \"no school\" OR \"half day\" OR \"field trip\" "
+               "OR \"permission slip\" OR PTA OR \"parent teacher\" OR \"report card\" "
+               "OR \"spirit day\" OR \"dress down\" OR \"dress code\" OR \"school closed\" "
+               "OR \"school closure\" OR recital OR practice OR tryouts OR \"schedule change\" "
+               "OR \"map test\" OR \"special event\" OR \"sign up\" OR newsletter "
+               "OR cheerleading OR tumbling OR climbing OR karate OR piano OR music "
+               "OR appointment OR checkup OR vaccination OR immunization OR dentist "
+               "OR pediatric OR prescription OR refill "
+               "OR \"bill due\" OR \"payment due\" OR invoice OR renewal OR insurance "
+               "OR maintenance OR delivery OR repair "
+               "OR invitation OR RSVP OR birthday OR party OR celebration "
+               "OR reminder OR deadline OR rescheduled OR cancelled "
+               "OR \"art show\" OR artwork OR performance OR showcase OR ceremony "
+               "OR gymnastics OR gymnastic OR show OR exhibit OR concert OR assembly "
+               "OR \"picture day\" OR \"rock climbing\")) after:" + after)
+    result   = service.users().messages().list(userId="me", q=query, maxResults=30).execute()
     messages = result.get("messages", [])
 
 
