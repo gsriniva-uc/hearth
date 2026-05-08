@@ -50,6 +50,53 @@ def migrate():
         else:
             print("[migrate] profiles.user_id already exists")
 
+
+    # ── tasks table ──────────────────────────────────────────────────────────
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id           TEXT    NOT NULL,
+            task_type         TEXT    NOT NULL,
+            title             TEXT    NOT NULL,
+            status            TEXT    DEFAULT 'pending',
+            due_date          TEXT,
+            draft_to          TEXT,
+            draft_subject     TEXT,
+            draft_body        TEXT,
+            payment_url       TEXT,
+            amount            TEXT,
+            company_login_url TEXT,
+            recurrence_days   INTEGER,
+            last_triggered    TEXT,
+            contact_name      TEXT,
+            contact_email     TEXT,
+            child_name        TEXT,
+            source_email_date TEXT,
+            created_at        TEXT DEFAULT (datetime('now')),
+            snoozed_until     TEXT,
+            thumbs            TEXT
+        )
+    """)
+
+    # ── patterns table ────────────────────────────────────────────────────────
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS patterns (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id          TEXT    NOT NULL,
+            pattern_type     TEXT    NOT NULL,
+            contact_email    TEXT,
+            contact_name     TEXT,
+            child_name       TEXT,
+            keywords         TEXT,
+            frequency_days   INTEGER DEFAULT 30,
+            last_action_date TEXT,
+            next_due_date    TEXT,
+            confidence_score REAL    DEFAULT 1.0,
+            created_at       TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    print("[migrate] tasks and patterns tables ready")
+
     conn.commit()
     conn.close()
     print("[migrate] Done.")
