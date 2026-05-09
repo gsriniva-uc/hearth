@@ -981,6 +981,37 @@ def _get_tasks(user_id: str, status: str = "pending") -> list:
 def get_tasks(user_id: str, status: str = "pending"):
     return _get_tasks(user_id, status)
 
+class TaskCreateRequest(BaseModel):
+    user_id:       str
+    task_type:     str
+    title:         str
+    due_date:      Optional[str] = None
+    amount:        Optional[str] = None
+    payment_url:   Optional[str] = None
+    company_login_url: Optional[str] = None
+    contact_name:  Optional[str] = None
+    contact_email: Optional[str] = None
+    child_name:    Optional[str] = None
+    draft_to:      Optional[str] = None
+    draft_subject: Optional[str] = None
+    draft_body:    Optional[str] = None
+
+@app.post("/tasks")
+def create_task(req: TaskCreateRequest):
+    with _tasks_conn() as c:
+        c.execute("""
+            INSERT INTO tasks(user_id,task_type,title,status,due_date,
+            amount,payment_url,company_login_url,contact_name,contact_email,
+            child_name,draft_to,draft_subject,draft_body)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (req.user_id, req.task_type, req.title, "pending", req.due_date,
+              req.amount, req.payment_url, req.company_login_url,
+              req.contact_name, req.contact_email, req.child_name,
+              req.draft_to, req.draft_subject, req.draft_body))
+        c.commit()
+        task_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return {"id": task_id, "status": "created"}
+
 
 @app.post("/tasks/scan")
 def scan_actions(user_id: str):
@@ -1314,6 +1345,99 @@ async def gmail_scan_debug(user_id: str):
                            if h["name"] == "Subject"), "no subject")
             all_subjects.append({"email": email, "subject": subject})
     return {"emails_found": len(all_subjects), "subjects": all_subjects}
+
+
+
+
+@app.post("/analyze-image")
+async def analyze_image(request: Request):
+    """
+    Analyze image/PDF with Claude Vision.
+    Extract events, bills, prescriptions, appointments etc.
+    Returns list of actionable items for user to confirm.
+    """
+    import anthropic as ant
+    import re as _re
+
+    try:
+        body      = await request.json()
+        user_id   = body.get("user_id", "")
+        image_b64 = body.get("image", "")
+        mime_type = body.get("mime_type", "image/jpeg")
+
+        if not image_b64:
+            return {"items": [], "error": "No image provided"}
+
+        today_str = datetime.date.today().strftime("%A, %B %d, %Y")
+        today_iso = datetime.date.today().isoformat()
+        children  = get_children(user_id)
+        child_str = ", ".join(children) or "the children"
+
+        prompt = (
+            "You are Hearth, a family AI assistant. Analyze this image and extract ALL actionable items.\n"
+            "Today: " + today_str + " (" + today_iso + "). Children: " + child_str + ".\n\n"
+            "Extract any of these:\n"
+            "1. Calendar events (school events, appointments, activities)\n"
+            "2. Bills or payments due\n"
+            "3. Prescription refills needed\n"
+            "4. Doctor/dentist appointments\n"
+            "5. Any other actionable reminder\n\n"
+            "Return ONLY a JSON array:\n"
+            "[{\n"
+            "  \"type\": \"event\" or \"task\",\n"
+            "  \"title\": \"brief title\",\n"
+            "  \"event_date\": \"YYYY-MM-DD or null\",\n"
+            "  \"event_time\": \"HH:MM or null\",\n"
+            "  \"event_type\": \"sports_game|activity|doctor_appointment|special_day|school_holiday|other\",\n"
+            "  \"child_name\": \"name or null\",\n"
+            "  \"notes\": \"details\",\n"
+            "  \"task_type\": \"bill|draft|followup or null\",\n"
+            "  \"amount\": \"$XX.XX or null\",\n"
+            "  \"due_date\": \"YYYY-MM-DD or null\",\n"
+            "  \"payment_url\": \"URL or null\",\n"
+            "  \"contact_name\": \"name or null\",\n"
+            "  \"draft_to\": \"email or null\",\n"
+            "  \"draft_subject\": \"subject or null\",\n"
+            "  \"draft_body\": \"email body or null\",\n"
+            "  \"selected\": true\n"
+            "}]\n"
+            "If nothing actionable found, return []."
+        )
+
+        client = ant.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+        resp   = client.messages.create(
+            model=cfg.CLAUDE_MODEL,
+            max_tokens=2048,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type":       "base64",
+                            "media_type": mime_type if mime_type.startswith("image/") else "image/jpeg",
+                            "data":       image_b64,
+                        }
+                    },
+                    {"type": "text", "text": prompt}
+                ]
+            }]
+        )
+
+        raw   = resp.content[0].text.strip()
+        raw   = _re.sub(r"^```json\s*", "", raw)
+        raw   = _re.sub(r"\s*```$", "", raw)
+        items = json.loads(raw)
+
+        # Ensure all items have selected=True by default
+        for item in items:
+            item["selected"] = True
+
+        return {"items": items, "error": None}
+
+    except Exception as e:
+        print("[analyze-image] " + str(e))
+        return {"items": [], "error": str(e)}
 
 
 if __name__ == "__main__":
