@@ -86,13 +86,21 @@ def _delete_event(user_id: str, event_id: int) -> bool:
         c.commit()
         return cur.rowcount > 0
 
-def _event_exists(user_id: str, child_name: str, event_type: str, event_date: str) -> bool:
+def _event_exists(user_id: str, child_name: str, event_type: str,
+                  event_date: str, notes: str = None) -> bool:
     if not os.path.exists(cfg.DB_PATH): return False
     with _conn() as c:
-        row = c.execute(
-            "SELECT id FROM events WHERE user_id=? AND child_name=?"
-            " AND event_type=? AND event_date=?",
-            (user_id, child_name, event_type, event_date)).fetchone()
+        if notes:
+            # Check by notes + date to avoid false duplicates
+            row = c.execute(
+                "SELECT id FROM events WHERE user_id=? AND event_date=?"
+                " AND LOWER(notes)=LOWER(?)",
+                (user_id, event_date, notes)).fetchone()
+        else:
+            row = c.execute(
+                "SELECT id FROM events WHERE user_id=? AND child_name=?"
+                " AND event_type=? AND event_date=?",
+                (user_id, child_name, event_type, event_date)).fetchone()
     return row is not None
 
 # ── Calendar sync ──────────────────────────────────────────────────────────────
@@ -225,6 +233,11 @@ def calendar_agent(state: HearthState) -> HearthState:
     if action == "add":
         for ev in intent.get("events",[]):
             try:
+                if _event_exists(user_id, ev.get("child_name","all"),
+                                   ev.get("event_type","other"), ev["event_date"],
+                                   ev.get("notes")):
+                    lines.append(f"⚠️ Already exists: {ev.get('notes') or ev.get('event_type')} on {ev['event_date']}")
+                    continue
                 eid = _insert_event(user_id, ev.get("child_name","all"),
                                     ev.get("event_type","other"), ev["event_date"],
                                     ev.get("event_time"), ev.get("notes"))
