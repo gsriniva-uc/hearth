@@ -70,14 +70,12 @@ def _query_upcoming(user_id: str, days_ahead=14) -> list:
     return [dict(r) for r in rows]
 
 def _query_today(user_id: str) -> list:
-    today    = date.today().isoformat()
-    now_time = datetime.now().strftime("%H:%M")
+    today = date.today().isoformat()
     with _conn() as c:
         rows = c.execute(
             "SELECT * FROM events WHERE user_id=? AND event_date=?"
-            " AND (event_time IS NULL OR event_time >= ?)"
             " ORDER BY event_time",
-            (user_id, today, now_time)).fetchall()
+            (user_id, today)).fetchall()
     return [dict(r) for r in rows]
 
 def _delete_event(user_id: str, event_id: int) -> bool:
