@@ -464,7 +464,7 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
         "OR gymnastics OR gymnastic OR show OR exhibit OR concert OR assembly "
         "OR \"picture day\" OR \"rock climbing\"))"
     )
-    result   = service.users().messages().list(userId="me", q=query, maxResults=30).execute()
+    result   = service.users().messages().list(userId="me", q=query, maxResults=50).execute()
     messages = result.get("messages", [])
     if not messages:
         return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
@@ -480,7 +480,7 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
         return ""
 
     emails_data = []
-    for msg in messages[:20]:
+    for msg in messages[:30]:
         try:
             full    = service.users().messages().get(
                 userId="me", id=msg["id"], format="full").execute()
@@ -489,7 +489,7 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
             date_h  = next((h["value"] for h in headers if h["name"] == "Date"), "")
             body    = extract_body(full["payload"])
             if body:
-                emails_data.append({"subject": subject, "body": body[:3000], "received": date_h})
+                emails_data.append({"subject": subject, "body": body[:5000], "received": date_h})
         except: continue
 
     if not emails_data:
@@ -515,7 +515,7 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
     )
 
     client = ant.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
-    resp   = client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=2048,
+    resp   = client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=4096,
              messages=[{"role": "user", "content": prompt}])
     raw    = re.sub(r"^```json\s*", "", resp.content[0].text.strip())
     raw    = re.sub(r"\s*```$", "", raw)
@@ -700,7 +700,7 @@ def _scan_bill_emails(user_id: str, email: str, days_back: int = 30) -> dict:
         return ""
 
     bills_found = 0
-    for msg in messages[:20]:
+    for msg in messages[:30]:
         try:
             full    = service.users().messages().get(
                 userId="me", id=msg["id"], format="full").execute()
