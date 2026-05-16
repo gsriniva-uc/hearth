@@ -666,11 +666,11 @@ def _scan_bill_emails(user_id: str, email: str, days_back: int = 30) -> dict:
     after   = (date.today() - timedelta(days=days_back)).strftime("%Y/%m/%d")
     bill_query = (
         "after:" + after + " "
-        "(\"payment due\" OR \"bill is ready\" OR \"amount due\" "
-        "OR \"statement available\" OR \"your bill\" OR invoice "
-        "OR \"balance due\" OR \"due date\" OR \"minimum payment\")"
+        "(subject:(invoice OR outstanding OR \"payment due\" OR \"bill is ready\" "
+        "OR \"amount due\" OR \"statement available\" OR \"your bill\" "
+        "OR \"balance due\" OR \"minimum payment\" OR \"auto pay\" "
+        "OR autopay OR pledge OR \"payment reminder\" OR \"amount owed\"))"
     )
-
     result   = service.users().messages().list(userId="me", q=bill_query, maxResults=30).execute()
     messages = result.get("messages", [])
 
