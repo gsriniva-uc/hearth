@@ -541,6 +541,48 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
 
 # ── Actions — Sent mail scanner, bill scanner, pattern evaluator ───────────────
 
+PHARMACY_DOMAINS    = ["cvs.com","walgreens.com","riteaid.com","duanereade.com",
+                       "costco.com","walmart.com","kroger.com","mailmymed.com",
+                       "expressscripts.com","caremark.com","optumrx.com"]
+INSURANCE_DOMAINS   = ["aetna.com","cigna.com","bcbs.com","bcbsnc.com","bcbsma.com",
+                       "uhc.com","unitedhealthcare.com","humana.com","anthem.com",
+                       "emblemhealth.com","oxford.com","magellanhealth.com"]
+MEDICAL_KEYWORDS_DOMAIN = ["medical","health","clinic","hospital","pediatric",
+                            "dental","dentist","physician","surgery","orthopedic",
+                            "dermatology","cardiology","neurology","oncology",
+                            "radiology","pediatrics","familymed","urgentcare"]
+PRESCRIPTION_SUBJECTS = ["refill","prescription ready","medication ready",
+                          "rx ready","your prescription","pickup ready"]
+DOCTOR_SUBJECTS       = ["appointment confirmation","your appointment",
+                          "visit reminder","appointment reminder","upcoming appointment"]
+INSURANCE_SUBJECTS    = ["explanation of benefits","eob","claim processed",
+                          "claim approved","claim denied","reimbursement","your claim"]
+
+def _is_pharmacy(addr: str) -> bool:
+    return any(d in addr for d in PHARMACY_DOMAINS)
+
+def _is_insurance_health(addr: str) -> bool:
+    return any(d in addr for d in INSURANCE_DOMAINS)
+
+def _is_medical(addr: str) -> bool:
+    return any(k in addr for k in MEDICAL_KEYWORDS_DOMAIN)
+
+def _classify_pattern(subject: str, from_addr: str, to_addr: str):
+    s   = subject.lower()
+    frm = from_addr.lower()
+    to  = to_addr.lower()
+    if _is_pharmacy(frm) and any(k in s for k in PRESCRIPTION_SUBJECTS):
+        return ("prescription", 30)
+    if _is_insurance_health(frm) and any(k in s for k in INSURANCE_SUBJECTS):
+        return ("insurance", 14)
+    if _is_medical(frm) and any(k in s for k in DOCTOR_SUBJECTS):
+        return ("doctor", 90)
+    if _is_pharmacy(to) and any(k in s for k in ["refill","prescription","medication"]):
+        return ("prescription", 30)
+    if _is_medical(to) and any(k in s for k in ["appointment","refill","prescription"]):
+        return ("doctor", 90)
+    return (None, None)
+
 def _scan_sent_mail(user_id: str, email: str, days_back: int = 90) -> dict:
     from googleapiclient.discovery import build
     from google.oauth2.credentials import Credentials
