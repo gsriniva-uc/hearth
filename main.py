@@ -1023,14 +1023,17 @@ def scan_actions(user_id: str):
     emails = _list_connected_emails(user_id)
     if not emails:
         return {"error": "No Gmail connected"}
-    total_bills = 0
+    total_patterns = total_bills = 0
     for email in emails:
+        r1 = _scan_sent_mail(user_id, email, days_back=90)
         r2 = _scan_bill_emails(user_id, email, days_back=30)
-        total_bills += r2.get("bills_found", 0)
+        total_patterns += r1.get("patterns_found", 0)
+        total_bills    += r2.get("bills_found", 0)
+    r3 = _evaluate_patterns(user_id)
     return {
-        "patterns_found": 0,
+        "patterns_found": total_patterns,
         "bills_found":    total_bills,
-        "tasks_created":  0,
+        "tasks_created":  r3.get("tasks_created", 0),
         "error": None
     }
 
