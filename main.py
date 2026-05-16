@@ -1456,6 +1456,136 @@ async def analyze_image(request: Request):
         return {"items": [], "error": str(e)}
 
 
+
+@app.post("/parse-pattern")
+async def parse_pattern(request: Request):
+    """Parse free text into a pattern using Claude."""
+    import anthropic as ant
+    body    = await request.json()
+    user_id = body.get("user_id", "")
+    text    = body.get("text", "")
+    if not text:
+        return {"pattern": None, "error": "No text provided"}
+
+    children    = get_children(user_id)
+    child_str   = ", ".join(children) or "none"
+    today_iso   = datetime.date.today().isoformat()
+
+    prompt = (
+        "Extract a recurring reminder pattern from this text.\n"
+        "Family children: " + child_str + ".\n"
+        "Today: " + today_iso + ".\n\n"
+        "Text: " + text + "\n\n"
+        "Return ONLY JSON:\n"
+        "{\n"
+        "  \"pattern_type\": \"prescription|doctor|insurance|pharmacy|other\",\n"
+        "  \"child_name\": \"child name or null\",\n"
+        "  \"contact_name\": \"provider name or null\",\n"
+        "  \"contact_email\": \"email address or null\",\n"
+        "  \"frequency_days\": 30,\n"
+        "  \"keywords\": \"brief description of what this reminder is for\"\n"
+        "}\n"
+        "If you cannot extract a clear pattern, return {}.\n"
+        "ONLY JSON."
+    )
+
+    try:
+        client = ant.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+        resp   = client.messages.create(
+            model=cfg.CLAUDE_MODEL, max_tokens=300,
+            messages=[{"role": "user", "content": prompt}])
+        raw    = re.sub(r"^```json\s*", "", resp.content[0].text.strip())
+        raw    = re.sub(r"\s*```$", "", raw)
+        data   = json.loads(raw)
+        if not data or not data.get("pattern_type"):
+            return {"pattern": None, "error": "Could not extract pattern"}
+        return {"pattern": data, "error": None}
+    except Exception as e:
+        return {"pattern": None, "error": str(e)}
+
+
+@app.post("/analyze-pattern")
+async def analyze_pattern(request: Request):
+    """Analyze image/PDF to extract a recurring pattern."""
+    import anthropic as ant
+    body      = await request.json()
+    user_id   = body.get("user_id", "")
+    image_b64 = body.get("image", "")
+    mime_type = body.get("mime_type", "image/jpeg")
+    if not image_b64:
+        return {"pattern": None, "error": "No image provided"}
+
+    children  = get_children(user_id)
+    child_str = ", ".join(children) or "none"
+    today_iso = datetime.date.today().isoformat()
+
+    prompt = (
+        "Look at this image and extract any recurring reminder or prescription pattern.\n"
+        "Family children: " + child_str + ".\n"
+        "Today: " + today_iso + ".\n\n"
+        "Return ONLY JSON:\n"
+        "{\n"
+        "  \"pattern_type\": \"prescription|doctor|insurance|pharmacy|other\",\n"
+        "  \"child_name\": \"child name or null\",\n"
+        "  \"contact_name\": \"provider/pharmacy name or null\",\n"
+        "  \"contact_email\": \"email or null\",\n"
+        "  \"frequency_days\": 30,\n"
+        "  \"keywords\": \"what medication or appointment this is for\"\n"
+        "}\n"
+        "If no pattern found, return {}.\n"
+        "ONLY JSON."
+    )
+
+    try:
+        client = ant.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+        resp   = client.messages.create(
+            model=cfg.CLAUDE_MODEL, max_tokens=300,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": mime_type if mime_type.startswith("image/") else "image/jpeg",
+                    "data": image_b64}},
+                {"type": "text", "text": prompt}
+            ]}])
+        raw  = re.sub(r"^```json\s*", "", resp.content[0].text.strip())
+        raw  = re.sub(r"\s*```$", "", raw)
+        data = json.loads(raw)
+        if not data or not data.get("pattern_type"):
+            return {"pattern": None, "error": "No pattern found"}
+        return {"pattern": data, "error": None}
+    except Exception as e:
+        return {"pattern": None, "error": str(e)}
+
+
+@app.post("/patterns/manual")
+async def create_manual_pattern(request: Request):
+    """Create a user-defined pattern manually."""
+    from datetime import date, timedelta
+    body         = await request.json()
+    user_id      = body.get("user_id", "")
+    pattern_type = body.get("pattern_type", "other")
+    contact_name = body.get("contact_name", "")
+    contact_email= body.get("contact_email", "")
+    child_name   = body.get("child_name")
+    frequency    = int(body.get("frequency_days", 30))
+    keywords     = body.get("keywords", "")
+    next_due     = date.today().isoformat()  # due immediately
+
+    with _tasks_conn() as c:
+        c.execute(
+            "INSERT INTO patterns(user_id,pattern_type,contact_email,"
+            "contact_name,keywords,frequency_days,last_action_date,"
+            "next_due_date,confidence_score,child_name) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (user_id, pattern_type, contact_email, contact_name,
+             keywords, frequency, date.today().isoformat(),
+             next_due, 1.0, child_name))
+        c.commit()
+
+    # Evaluate immediately to create draft if due
+    _evaluate_patterns(user_id)
+    return {"status": "created"}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=cfg.API_PORT, reload=True)
