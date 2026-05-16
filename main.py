@@ -20,6 +20,7 @@ from agent.briefing_agent import _build_briefing
 from agent.graph import run
 from db_migrate import migrate
 
+
 app = FastAPI(title="Hearth API", version="1.0.0")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
@@ -42,6 +43,7 @@ GMAIL_SCOPES = [
 
 # In-memory auth codes
 _auth_codes: dict = {}
+
 
 
 @app.on_event("startup")
