@@ -593,21 +593,41 @@ def _scan_sent_mail(user_id: str, email: str, days_back: int = 90) -> dict:
             if not to or not subject:
                 continue
 
-            s = subject.lower()
-            if any(k in s for k in ["refill", "prescription", "medication"]):
+            s       = subject.lower()
+            to_addr = to.lower()
+
+            # Only classify if recipient looks like a medical/insurance provider
+            is_medical_domain = any(k in to_addr for k in [
+                "doctor", "medical", "health", "clinic", "hospital", "pediatric",
+                "dental", "dentist", "pharmacy", "cvs", "walgreens", "riteaid",
+                "insurance", "aetna", "cigna", "bcbs", "unitedhealth", "humana",
+                "anthem", "prescription", "rx", "md", "dds", "dmd", "pharm"
+            ])
+
+            if not is_medical_domain:
+                # Also check subject for very specific medical keywords
+                is_medical_subject = any(k in s for k in [
+                    "prescription refill", "medication refill", "rx refill",
+                    "insurance claim", "eob", "reimbursement claim"
+                ])
+                if not is_medical_subject:
+                    continue
+
+            if any(k in s for k in ["refill", "prescription", "medication", "rx"]):
                 ptype = "prescription"
                 freq  = 30
-            elif any(k in s for k in ["appointment", "schedule", "booking"]):
+            elif any(k in s for k in ["appointment", "schedule", "booking", "visit"]):
                 ptype = "doctor"
                 freq  = 90
             elif any(k in s for k in ["claim", "reimbursement", "eob"]):
                 ptype = "insurance"
                 freq  = 14
-            elif any(k in s for k in ["pharmacy", "cvs", "walgreens", "rite aid"]):
+            elif any(k in to_addr for k in ["pharmacy", "cvs", "walgreens", "rite aid"]):
                 ptype = "pharmacy"
                 freq  = 30
             else:
-                continue
+                ptype = "doctor"
+                freq  = 90
 
             with _tasks_conn() as c:
                 existing = c.execute(
