@@ -84,7 +84,8 @@ def _fetch_school_emails(access_token, days_back=14):
 def _extract_events(emails):
     if not emails: return []
     today_str    = date.today().strftime("%A, %B %d, %Y")
-    children_str = ", ".join(cfg.CHILDREN) or "the children"
+    from agent.profile_agent import get_children
+    children_str = ", ".join(get_children(user_id)) or "the children"
     digest = "".join(f"\n--- {e['subject']} ---\n{e['body']}\n" for e in emails)
     prompt = f"""Hearth assistant. Today: {today_str}. Children: {children_str}.
 Valid event_type: {", ".join(EVENT_TYPES)}.

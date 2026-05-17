@@ -164,7 +164,8 @@ def _parse_intent(text, input_type, extracted_events) -> dict:
     today_str    = date.today().strftime("%A, %B %d, %Y")
     today_iso    = date.today().isoformat()
     tomorrow_iso = (date.today()+timedelta(days=1)).isoformat()
-    children_str = ", ".join(cfg.CHILDREN) or "the children"
+    from agent.profile_agent import get_children
+    children_str = ", ".join(get_children(user_id)) or "the children"
 
     # Deterministic pre-check before hitting LLM
     text_lower = text.lower().strip()

@@ -144,7 +144,8 @@ def _extract_via_text(text: str, children: list) -> list:
 def event_parser(state: HearthState) -> HearthState:
     pdf_bytes = state.get("pdf_bytes")
     raw_text  = state.get("raw_text") or ""
-    children  = cfg.CHILDREN
+    from agent.profile_agent import get_children
+    children  = get_children(user_id) or cfg.CHILDREN
 
     if not pdf_bytes and not raw_text:
         return {**state, "extracted_events": [],
