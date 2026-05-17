@@ -448,10 +448,31 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
 
     service = build("gmail", "v1", credentials=creds)
     after   = (date.today() - timedelta(days=30)).strftime("%Y/%m/%d")
-    query = "after:" + after + " (subject:(reminder OR newsletter OR RSVP OR cheerleading OR performance OR appointment OR invoice OR payment OR festival OR recital OR dismissal OR activity OR birthday OR show OR concert OR \"no school\"))"
-    result   = service.users().messages().list(userId="me", q=query, maxResults=50).execute()
-    messages = result.get("messages", [])
+    # Pass 1 — subject keyword match
+    query1 = ("after:" + after + " (subject:(reminder OR newsletter OR RSVP OR "
+              "cheerleading OR performance OR appointment OR invoice OR payment OR "
+              "festival OR recital OR dismissal OR activity OR birthday OR show OR "
+              "concert OR \"no school\" OR gymnastics OR class OR trial OR "
+              "\"art show\" OR \"picture day\" OR \"early dismissal\" OR "
+              "\"field trip\" OR \"dress down\" OR \"spirit day\" OR "
+              "\"school closed\" OR \"half day\" OR \"parent teacher\"))"
+    )
+    # Pass 2 — recent emails regardless of subject
+    query2 = "after:" + after + " -category:promotions -category:social -from:noreply -from:no-reply"
+
+    result1  = service.users().messages().list(userId="me", q=query1, maxResults=30).execute()
+    result2  = service.users().messages().list(userId="me", q=query2, maxResults=20).execute()
+
+    # Merge and deduplicate by message ID
+    seen_ids = set()
+    messages = []
+    for msg in result1.get("messages", []) + result2.get("messages", []):
+        if msg["id"] not in seen_ids:
+            seen_ids.add(msg["id"])
+            messages.append(msg)
+
     if not messages:
+        return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
         return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
 
     def extract_body(payload):
