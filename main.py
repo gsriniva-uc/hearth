@@ -530,7 +530,7 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
               "\"school closed\" OR \"half day\" OR \"parent teacher\"))"
     )
     # Pass 2 — recent emails regardless of subject
-    query2 = "after:" + after + " -category:promotions -category:social -from:noreply -from:no-reply"
+    query2 = "after:" + after
 
     result1  = service.users().messages().list(userId="me", q=query1, maxResults=30).execute()
     result2  = service.users().messages().list(userId="me", q=query2, maxResults=20).execute()
