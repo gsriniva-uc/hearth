@@ -53,6 +53,77 @@ def startup():
     init_db()
     init_profiles()
     _init_push_tokens()
+    # Start background scheduler
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.cron import CronTrigger
+    import pytz
+
+    def run_daily_briefing():
+        from agent.calendar_agent import _conn
+        from datetime import date
+        with _conn() as c:
+            user_ids = [r[0] for r in c.execute(
+                "SELECT DISTINCT user_id FROM push_tokens").fetchall()]
+        for user_id in user_ids:
+            tokens = _get_push_tokens(user_id)
+            if not tokens: continue
+            today_events = _query_today(user_id)
+            if not today_events:
+                body = "No events today. Enjoy your day!"
+            else:
+                parts = []
+                for ev in today_events[:3]:
+                    note   = ev.get("notes") or ev.get("event_type","").replace("_"," ").title()
+                    time   = " at " + ev["event_time"] if ev.get("event_time") else ""
+                    child  = ev.get("child_name","")
+                    prefix = (child + ": ") if child and child != "all" else ""
+                    parts.append(prefix + note + time)
+                body = ", ".join(parts)
+                if len(today_events) > 3:
+                    body += f" +{len(today_events)-3} more"
+            _send_push(tokens, "🏠 Hearth Morning Briefing", body)
+
+    def run_nudges():
+        from agent.calendar_agent import _conn
+        from datetime import date, timedelta
+        today    = date.today().isoformat()
+        in_2days = (date.today() + timedelta(days=2)).isoformat()
+        with _conn() as c:
+            user_ids = [r[0] for r in c.execute(
+                "SELECT DISTINCT user_id FROM push_tokens").fetchall()]
+        for user_id in user_ids:
+            tokens = _get_push_tokens(user_id)
+            if not tokens: continue
+            with _conn() as c:
+                day_of  = [dict(r) for r in c.execute(
+                    "SELECT * FROM events WHERE user_id=? AND event_date=? AND nudge_sent_day=0",
+                    (user_id, today)).fetchall()]
+                two_day = [dict(r) for r in c.execute(
+                    "SELECT * FROM events WHERE user_id=? AND event_date=? AND nudge_sent_48h=0",
+                    (user_id, in_2days)).fetchall()]
+            for ev in day_of:
+                note   = ev.get("notes") or ev.get("event_type","").replace("_"," ").title()
+                time   = " at " + ev["event_time"] if ev.get("event_time") else ""
+                child  = ev.get("child_name","")
+                prefix = (child + ": ") if child and child != "all" else ""
+                _send_push(tokens, "📅 Today", prefix + note + time)
+                with _conn() as c:
+                    c.execute("UPDATE events SET nudge_sent_day=1 WHERE id=?", (ev["id"],))
+                    c.commit()
+            for ev in two_day:
+                note   = ev.get("notes") or ev.get("event_type","").replace("_"," ").title()
+                child  = ev.get("child_name","")
+                prefix = (child + ": ") if child and child != "all" else ""
+                _send_push(tokens, "⏰ In 2 days", prefix + note)
+                with _conn() as c:
+                    c.execute("UPDATE events SET nudge_sent_48h=1 WHERE id=?", (ev["id"],))
+                    c.commit()
+
+    scheduler = BackgroundScheduler(timezone=pytz.timezone("America/New_York"))
+    scheduler.add_job(run_daily_briefing, CronTrigger(hour=7, minute=0))
+    scheduler.add_job(run_nudges,         CronTrigger(hour=7, minute=5))
+    scheduler.start()
+    print("[hearth] scheduler started")
     print(f"[hearth] started — {cfg.DB_PATH}")
 
 
