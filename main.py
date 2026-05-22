@@ -52,6 +52,7 @@ def startup():
     migrate()
     init_db()
     init_profiles()
+    _init_push_tokens()
     print(f"[hearth] started — {cfg.DB_PATH}")
 
 
@@ -1627,6 +1628,156 @@ def debug_all_users():
                         emails.append(email)
                 users.append({"user_id": user_id, "emails": emails})
     return {"users": users, "count": len(users)}
+
+
+# ── Push Notifications ─────────────────────────────────────────────────────────
+
+def _init_push_tokens():
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS push_tokens (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    TEXT NOT NULL,
+                token      TEXT NOT NULL UNIQUE,
+                platform   TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        c.commit()
+
+def _get_push_tokens(user_id: str) -> list:
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT token FROM push_tokens WHERE user_id=?",
+            (user_id,)).fetchall()
+    return [r["token"] for r in rows]
+
+def _send_push(tokens: list, title: str, body: str, data: dict = None):
+    """Send push notification via Expo Push API."""
+    import httpx
+    if not tokens:
+        return
+    messages = [{"to": t, "title": title, "body": body,
+                 "sound": "default", "data": data or {}}
+                for t in tokens]
+    try:
+        httpx.post("https://exp.host/--/api/v2/push/send",
+                   json=messages, timeout=10)
+        print(f"[push] sent to {len(tokens)} device(s): {title}")
+    except Exception as e:
+        print(f"[push] failed: {e}")
+
+
+@app.post("/push/register")
+async def register_push_token(request: Request):
+    body     = await request.json()
+    user_id  = body.get("user_id", "")
+    token    = body.get("token", "")
+    platform = body.get("platform", "")
+    if not user_id or not token:
+        return {"status": "error", "error": "Missing user_id or token"}
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        c.execute("""
+            INSERT INTO push_tokens(user_id, token, platform)
+            VALUES(?,?,?)
+            ON CONFLICT(token) DO UPDATE SET user_id=excluded.user_id
+        """, (user_id, token, platform))
+        c.commit()
+    print(f"[push] registered token for {user_id}")
+    return {"status": "ok"}
+
+
+@app.post("/push/daily-briefing")
+async def send_daily_briefing(secret: str = ""):
+    """Send 7am briefing to all users. Called by cron."""
+    if secret != os.getenv("CRON_SECRET", "hearth-cron-2026"):
+        raise HTTPException(403, "Unauthorized")
+    from agent.calendar_agent import _conn
+    from datetime import date
+    with _conn() as c:
+        user_ids = [r[0] for r in c.execute(
+            "SELECT DISTINCT user_id FROM push_tokens").fetchall()]
+    sent = 0
+    for user_id in user_ids:
+        tokens = _get_push_tokens(user_id)
+        if not tokens:
+            continue
+        today_events = _query_today(user_id)
+        if not today_events:
+            body = "No events scheduled today. Enjoy your day!"
+        else:
+            parts = []
+            for ev in today_events[:3]:
+                note  = ev.get("notes") or ev.get("event_type","").replace("_"," ").title()
+                time  = " at " + ev["event_time"] if ev.get("event_time") else ""
+                child = ev.get("child_name","")
+                if child and child != "all":
+                    parts.append(child + ": " + note + time)
+                else:
+                    parts.append(note + time)
+            body = ", ".join(parts)
+            if len(today_events) > 3:
+                body += f" +{len(today_events)-3} more"
+        _send_push(tokens, "🏠 Hearth Morning Briefing", body)
+        sent += 1
+    return {"sent": sent}
+
+
+@app.post("/push/nudge")
+async def send_nudges(secret: str = ""):
+    """Send nudge notifications for upcoming events. Called by cron."""
+    if secret != os.getenv("CRON_SECRET", "hearth-cron-2026"):
+        raise HTTPException(403, "Unauthorized")
+    from agent.calendar_agent import _conn
+    from datetime import date, timedelta
+    today    = date.today().isoformat()
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    in_2days = (date.today() + timedelta(days=2)).isoformat()
+
+    with _conn() as c:
+        user_ids = [r[0] for r in c.execute(
+            "SELECT DISTINCT user_id FROM push_tokens").fetchall()]
+
+    sent = 0
+    for user_id in user_ids:
+        tokens = _get_push_tokens(user_id)
+        if not tokens:
+            continue
+        with _conn() as c:
+            # Day-of nudges (not yet sent)
+            day_of = c.execute(
+                "SELECT * FROM events WHERE user_id=? AND event_date=? AND nudge_sent_day=0",
+                (user_id, today)).fetchall()
+            # 48h nudges
+            two_day = c.execute(
+                "SELECT * FROM events WHERE user_id=? AND event_date=? AND nudge_sent_48h=0",
+                (user_id, in_2days)).fetchall()
+
+        for ev in [dict(r) for r in day_of]:
+            note  = ev.get("notes") or ev.get("event_type","").replace("_"," ").title()
+            time  = " at " + ev["event_time"] if ev.get("event_time") else ""
+            child = ev.get("child_name","")
+            prefix = (child + ": ") if child and child != "all" else ""
+            _send_push(tokens, "📅 Today", prefix + note + time)
+            with _conn() as c:
+                c.execute("UPDATE events SET nudge_sent_day=1 WHERE id=?", (ev["id"],))
+                c.commit()
+            sent += 1
+
+        for ev in [dict(r) for r in two_day]:
+            note  = ev.get("notes") or ev.get("event_type","").replace("_"," ").title()
+            child = ev.get("child_name","")
+            prefix = (child + ": ") if child and child != "all" else ""
+            _send_push(tokens, "⏰ In 2 days", prefix + note)
+            with _conn() as c:
+                c.execute("UPDATE events SET nudge_sent_48h=1 WHERE id=?", (ev["id"],))
+                c.commit()
+            sent += 1
+
+    return {"nudges_sent": sent}
 
 if __name__ == "__main__":
     import uvicorn
