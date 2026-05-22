@@ -175,7 +175,7 @@ def _sync_to_outlook(user_id, event_id, child_name, event_type,
 
 # ── LLM intent ─────────────────────────────────────────────────────────────────
 
-def _parse_intent(text, input_type, extracted_events) -> dict:
+def _parse_intent(text, input_type, extracted_events, user_id="default") -> dict:
     if extracted_events:
         return {"action":"add","events":extracted_events,"query_window_days":7}
 
@@ -244,7 +244,8 @@ def calendar_agent(state: HearthState) -> HearthState:
     user_id = state.get("user_id") or "default"
     intent  = _parse_intent(state.get("raw_text") or "",
                             state.get("input_type","query"),
-                            state.get("extracted_events",[]))
+                            state.get("extracted_events",[]),
+                            user_id)
     action, confirmed, lines = intent.get("action","query"), [], []
 
     if action == "add":
