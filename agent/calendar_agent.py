@@ -84,22 +84,40 @@ def _delete_event(user_id: str, event_id: int) -> bool:
         c.commit()
         return cur.rowcount > 0
 
+def _similarity(a: str, b: str) -> float:
+    """Simple word overlap similarity between two strings."""
+    if not a or not b: return 0.0
+    a_words = set(a.lower().split())
+    b_words = set(b.lower().split())
+    if not a_words or not b_words: return 0.0
+    overlap = len(a_words & b_words)
+    return overlap / max(len(a_words), len(b_words))
+
 def _event_exists(user_id: str, child_name: str, event_type: str,
                   event_date: str, notes: str = None) -> bool:
     if not os.path.exists(cfg.DB_PATH): return False
     with _conn() as c:
-        if notes:
-            # Check by notes + date to avoid false duplicates
-            row = c.execute(
-                "SELECT id FROM events WHERE user_id=? AND event_date=?"
-                " AND LOWER(notes)=LOWER(?)",
-                (user_id, event_date, notes)).fetchone()
-        else:
+        # Get all events on same date for this user
+        rows = c.execute(
+            "SELECT notes FROM events WHERE user_id=? AND event_date=?",
+            (user_id, event_date)).fetchall()
+    if notes:
+        for row in rows:
+            existing_notes = row["notes"] or ""
+            # Exact match
+            if existing_notes.lower() == notes.lower():
+                return True
+            # Fuzzy match — 70% word overlap = duplicate
+            if _similarity(existing_notes, notes) >= 0.7:
+                return True
+        return False
+    else:
+        with _conn() as c:
             row = c.execute(
                 "SELECT id FROM events WHERE user_id=? AND child_name=?"
                 " AND event_type=? AND event_date=?",
                 (user_id, child_name, event_type, event_date)).fetchone()
-    return row is not None
+        return row is not None
 
 # ── Calendar sync ──────────────────────────────────────────────────────────────
 
