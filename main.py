@@ -1850,6 +1850,58 @@ async def send_nudges(secret: str = ""):
 
     return {"nudges_sent": sent}
 
+
+@app.post("/gmail/scan-debug-v2")
+async def gmail_scan_debug_v2(user_id: str):
+    from googleapiclient.discovery import build
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from datetime import date, timedelta
+    import anthropic as ant
+
+    emails_list = _list_connected_emails(user_id)
+    if not emails_list:
+        return {"error": "No Gmail connected"}
+
+    email = emails_list[0]
+    token_data = _load_token(user_id, email)
+    creds = Credentials(
+        token=token_data.get("access_token"),
+        refresh_token=token_data.get("refresh_token"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+    )
+    if not creds.valid and creds.refresh_token:
+        creds.refresh(Request())
+
+    service  = build("gmail", "v1", credentials=creds)
+    after    = (date.today() - timedelta(days=3)).strftime("%Y/%m/%d")
+    result   = service.users().messages().list(userId="me", q="after:" + after, maxResults=10).execute()
+    messages = result.get("messages", [])
+
+    def extract_body(payload):
+        data = payload.get("body", {}).get("data", "")
+        if data and "text" in payload.get("mimeType", ""):
+            try: return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+            except: return ""
+        for part in payload.get("parts", []):
+            t = extract_body(part)
+            if t: return t
+        return ""
+
+    emails_data = []
+    for msg in messages[:5]:
+        full    = service.users().messages().get(userId="me", id=msg["id"], format="full").execute()
+        headers = full["payload"].get("headers", [])
+        subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
+        date_h  = next((h["value"] for h in headers if h["name"] == "Date"), "")
+        body    = extract_body(full["payload"])
+        emails_data.append({"subject": subject, "received": date_h, "body_preview": body[:300]})
+
+    return {"emails_found": len(emails_data), "emails": emails_data}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=cfg.API_PORT, reload=True)
