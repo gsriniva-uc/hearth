@@ -1607,6 +1607,27 @@ async def create_manual_pattern(request: Request):
     _evaluate_patterns(user_id)
     return {"status": "created"}
 
+
+@app.get("/debug/all-users")
+def debug_all_users():
+    import os
+    token_base = os.path.join(cfg.DATA_DIR, "tokens")
+    users = []
+    if os.path.exists(token_base):
+        for user_id in os.listdir(token_base):
+            token_dir = os.path.join(token_base, user_id)
+            if os.path.isdir(token_dir):
+                emails = []
+                for fname in os.listdir(token_dir):
+                    if fname.startswith("gmail_") and fname.endswith(".json"):
+                        safe  = fname[6:-5]
+                        email = safe.replace("_at_", "@", 1)
+                        parts = email.split("@")
+                        email = "@".join(p.replace("_", ".") for p in parts)
+                        emails.append(email)
+                users.append({"user_id": user_id, "emails": emails})
+    return {"users": users, "count": len(users)}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=cfg.API_PORT, reload=True)
