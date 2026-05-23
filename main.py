@@ -1909,6 +1909,43 @@ async def gmail_scan_debug_v2(user_id: str):
 
     return {"emails_found": len(emails_data), "emails": emails_data}
 
+
+@app.get("/events/conflicts")
+def get_conflicts(user_id: str, days_ahead: int = 14):
+    """Find events with overlapping times on same date."""
+    events = _query_upcoming(user_id, days_ahead=days_ahead)
+    conflicts = []
+    by_date = {}
+    for ev in events:
+        d = ev["event_date"]
+        if d not in by_date:
+            by_date[d] = []
+        by_date[d].append(ev)
+    for d, evs in by_date.items():
+        timed = [e for e in evs if e.get("event_time")]
+        for i in range(len(timed)):
+            for j in range(i+1, len(timed)):
+                if timed[i]["event_time"] == timed[j]["event_time"]:
+                    conflicts.append({
+                        "date":   d,
+                        "event1": timed[i].get("notes") or timed[i]["event_type"],
+                        "event2": timed[j].get("notes") or timed[j]["event_type"],
+                        "time":   timed[i]["event_time"]
+                    })
+    return {"conflicts": conflicts}
+
+
+@app.delete("/debug/delete-token")
+def delete_token(user_id: str, email: str):
+    """Delete a stored token to force re-auth."""
+    import os
+    safe  = email.replace(".", "_").replace("@", "_at_")
+    path  = os.path.join(_token_dir(user_id), "gmail_" + safe + ".json")
+    if os.path.exists(path):
+        os.remove(path)
+        return {"status": "deleted", "email": email}
+    return {"status": "not found"}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=cfg.API_PORT, reload=True)
