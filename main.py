@@ -1317,16 +1317,26 @@ def agent_chat(req: AgentRequest):
     confirmed = result.get("confirmed_events", [])
     print("[gcal debug] confirmed_events: " + str(len(confirmed)) + " events")
     emails    = _list_connected_emails(req.user_id)
-    if confirmed and emails:
+    # Use primary user email for GCal (not first connected which may be wife's)
+    from agent.calendar_agent import _conn as _cal_conn
+    session_path = os.path.join(cfg.DATA_DIR, "sessions", req.user_id + ".json")
+    primary_email = None
+    if os.path.exists(session_path):
+        with open(session_path) as f:
+            import json as _json
+            primary_email = _json.load(f).get("email")
+    gcal_email = primary_email if primary_email and primary_email in emails else (emails[0] if emails else None)
+    print("[gcal debug] using email: " + str(gcal_email))
+    if confirmed and gcal_email:
         for ev in confirmed:
             try:
                 gcal_summary = ev.get("notes") or ev.get("event_type","event").replace("_"," ").title()
                 child = ev.get("child_name","")
                 if child and child != "all":
                     gcal_summary = child + " - " + gcal_summary
-                svc = _get_gcal_service(req.user_id, emails[0])
+                svc = _get_gcal_service(req.user_id, gcal_email)
                 if svc and not _gcal_event_exists(svc, gcal_summary, ev["event_date"]):
-                    gcal_id = _write_to_gcal(req.user_id, emails[0], gcal_summary,
+                    gcal_id = _write_to_gcal(req.user_id, gcal_email, gcal_summary,
                                              ev["event_date"], ev.get("event_time"),
                                              ev.get("notes"))
                     if gcal_id and gcal_id != "duplicate":
