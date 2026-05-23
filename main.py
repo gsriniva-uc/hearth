@@ -1003,7 +1003,12 @@ def gmail_scan_all(user_id: str):
     for email in emails:
         r = _scan_single_gmail(user_id, email)
         if r.get("error"):
-            errors.append(email + ": " + str(r["error"]))
+            if "expired" in str(r.get("error","")).lower() or "invalid_grant" in str(r.get("error","")).lower() or "not authenticated" in str(r.get("error","")).lower():
+                errors.append({"email": email, "error": "token_expired",
+                    "message": email + " needs to reconnect",
+                    "reauth_url": "https://hearth-4kqf.onrender.com/auth/login?user_id=" + user_id + "&add_account=true"})
+            else:
+                errors.append({"email": email, "error": str(r["error"])})
         else:
             total_new     += r.get("new", 0)
             total_skipped += r.get("skipped", 0)
