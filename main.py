@@ -219,7 +219,14 @@ def _get_gcal_service(user_id: str, email: str):
             token_data["access_token"] = creds.token
             _save_token(user_id, email, token_data)
         except Exception as e:
-            print("[gcal] refresh failed: " + str(e))
+        except Exception as e:
+            print(f"[gcal] refresh failed for {email}: {e}")
+            if "invalid_grant" in str(e):
+                import os as _os
+                safe = email.replace(".", "_").replace("@", "_at_")
+                path = _os.path.join(_token_dir(user_id), "gmail_" + safe + ".json")
+                if _os.path.exists(path): _os.remove(path)
+                print(f"[gcal] deleted expired token for {email}")
             return None
     return build("calendar", "v3", credentials=creds)
 
