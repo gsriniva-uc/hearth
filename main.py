@@ -1309,6 +1309,7 @@ def agent_chat(req: AgentRequest):
 
     # Write confirmed events to Google Calendar
     confirmed = result.get("confirmed_events", [])
+    print("[gcal debug] confirmed_events: " + str(len(confirmed)) + " events")
     emails    = _list_connected_emails(req.user_id)
     if confirmed and emails:
         for ev in confirmed:
