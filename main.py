@@ -219,7 +219,7 @@ def _get_gcal_service(user_id: str, email: str):
             token_data["access_token"] = creds.token
             _save_token(user_id, email, token_data)
         except Exception as e:
-            print(f"[gcal] refresh failed for {email}: {e}")
+            print(f"[gcal] refresh failed for {email} user {user_id}: {e}")
             if "invalid_grant" in str(e):
                 import os as _os
                 safe = email.replace(".", "_").replace("@", "_at_")
