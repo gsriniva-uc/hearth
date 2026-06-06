@@ -53,6 +53,7 @@ def startup():
     init_db()
     init_profiles()
     _init_push_tokens()
+    _init_camps()
     # Start background scheduler
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
@@ -1960,6 +1961,271 @@ def delete_token(user_id: str, email: str):
         os.remove(path)
         return {"status": "deleted", "email": email}
     return {"status": "not found"}
+
+
+# ── Camps ──────────────────────────────────────────────────────────────────────
+
+def _init_camps():
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS camps (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id              TEXT NOT NULL,
+                child_name           TEXT,
+                camp_name            TEXT NOT NULL,
+                registration_deadline TEXT,
+                camp_start_date      TEXT,
+                camp_end_date        TEXT,
+                session_type         TEXT,
+                registration_url     TEXT,
+                status               TEXT DEFAULT 'pending',
+                nudge_sent_2w        INTEGER DEFAULT 0,
+                nudge_sent_3d        INTEGER DEFAULT 0,
+                nudge_sent_day       INTEGER DEFAULT 0,
+                confirmed_registered INTEGER DEFAULT 0,
+                created_at           TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        c.commit()
+
+def _camps_conn():
+    from agent.calendar_agent import _conn
+    return _conn()
+
+
+@app.post("/camps/parse")
+async def parse_camps(request: Request):
+    """Claude extracts camp details from free text, per child."""
+    import anthropic as ant
+    body      = await request.json()
+    user_id   = body.get("user_id", "")
+    child     = body.get("child_name", "")
+    text      = body.get("text", "")
+    today_iso = datetime.date.today().isoformat()
+
+    if not text:
+        return {"camps": [], "error": "No text"}
+
+    prompt = (
+        "Extract summer/activity camp details from this text.\n"
+        "Child: " + child + "\n"
+        "Today: " + today_iso + "\n\n"
+        "Text: " + text + "\n\n"
+        "Return ONLY a JSON array of camps:\n"
+        "[{\n"
+        "  \"camp_name\": \"name of camp\",\n"
+        "  \"registration_deadline\": \"YYYY-MM-DD or null\",\n"
+        "  \"camp_start_date\": \"YYYY-MM-DD or null\",\n"
+        "  \"camp_end_date\": \"YYYY-MM-DD or null\",\n"
+        "  \"session_type\": \"full_day or half_day or weekly or null\"\n"
+        "}]\n"
+        "If multiple camps mentioned, return all of them.\n"
+        "ONLY JSON array."
+    )
+
+    try:
+        client = ant.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+        resp   = client.messages.create(
+            model=cfg.CLAUDE_MODEL, max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}])
+        raw  = re.sub(r"^```json\s*", "", resp.content[0].text.strip())
+        raw  = re.sub(r"\s*```$", "", raw)
+        data = json.loads(raw)
+        return {"camps": data, "error": None}
+    except Exception as e:
+        return {"camps": [], "error": str(e)}
+
+
+@app.post("/camps")
+async def create_camp(request: Request):
+    """Save a camp for a user."""
+    body       = await request.json()
+    user_id    = body.get("user_id", "")
+    child      = body.get("child_name", "")
+    camp_name  = body.get("camp_name", "")
+    deadline   = body.get("registration_deadline")
+    start_date = body.get("camp_start_date")
+    end_date   = body.get("camp_end_date")
+    session    = body.get("session_type")
+    url        = body.get("registration_url")
+
+    if not user_id or not camp_name:
+        return {"status": "error", "error": "Missing user_id or camp_name"}
+
+    with _camps_conn() as c:
+        c.execute(
+            "INSERT INTO camps(user_id, child_name, camp_name, registration_deadline, "
+            "camp_start_date, camp_end_date, session_type, registration_url) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (user_id, child, camp_name, deadline, start_date, end_date, session, url))
+        c.commit()
+        camp_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    return {"status": "created", "id": camp_id}
+
+
+@app.get("/camps")
+def get_camps(user_id: str):
+    """List all camps for a user."""
+    with _camps_conn() as c:
+        rows = c.execute(
+            "SELECT * FROM camps WHERE user_id=? ORDER BY registration_deadline ASC",
+            (user_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.put("/camps/{camp_id}/status")
+async def update_camp_status(camp_id: int, request: Request):
+    """Mark a camp as registered or missed."""
+    body   = await request.json()
+    status = body.get("status", "registered")
+    user_id = body.get("user_id", "")
+    with _camps_conn() as c:
+        c.execute(
+            "UPDATE camps SET status=?, confirmed_registered=? WHERE id=? AND user_id=?",
+            (status, 1 if status == "registered" else 0, camp_id, user_id))
+        c.commit()
+
+    # If registered, write GCal events for camp dates
+    if status == "registered":
+        with _camps_conn() as c:
+            camp = dict(c.execute("SELECT * FROM camps WHERE id=?", (camp_id,)).fetchone())
+        if camp.get("camp_start_date") and camp.get("camp_end_date"):
+            emails = _list_connected_emails(user_id)
+            if emails:
+                summary = camp["child_name"] + " - " + camp["camp_name"] if camp.get("child_name") else camp["camp_name"]
+                try:
+                    _write_to_gcal(user_id, emails[0], summary,
+                                   camp["camp_start_date"], None,
+                                   camp["camp_name"] + " camp (" + camp["camp_start_date"] + " to " + camp["camp_end_date"] + ")")
+                    print(f"[camps] GCal event written for {summary}")
+                except Exception as e:
+                    print(f"[camps] GCal write error: {e}")
+
+    return {"status": "updated"}
+
+
+@app.delete("/camps/{camp_id}")
+def delete_camp(camp_id: int, user_id: str):
+    with _camps_conn() as c:
+        c.execute("DELETE FROM camps WHERE id=? AND user_id=?", (camp_id, user_id))
+        c.commit()
+    return {"status": "deleted"}
+
+
+@app.post("/camps/search-urls")
+async def search_camp_urls(user_id: str = ""):
+    """Search web for registration URLs for camps that don't have one."""
+    import anthropic as ant
+    with _camps_conn() as c:
+        if user_id:
+            camps = [dict(r) for r in c.execute(
+                "SELECT * FROM camps WHERE user_id=? AND registration_url IS NULL AND status='pending'",
+                (user_id,)).fetchall()]
+        else:
+            camps = [dict(r) for r in c.execute(
+                "SELECT * FROM camps WHERE registration_url IS NULL AND status='pending'").fetchall()]
+
+    updated = 0
+    for camp in camps:
+        try:
+            client = ant.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+            prompt = (
+                "Search for the registration URL for this camp: \"" + camp["camp_name"] + "\"\n"
+                "Return ONLY a JSON object: {\"url\": \"https://...\" or null}\n"
+                "If you cannot find a specific registration URL, return {\"url\": null}\n"
+                "ONLY JSON."
+            )
+            resp = client.messages.create(
+                model=cfg.CLAUDE_MODEL, max_tokens=200,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[{"role": "user", "content": prompt}])
+            for block in resp.content:
+                if hasattr(block, "text"):
+                    raw = re.sub(r"^```json\s*", "", block.text.strip())
+                    raw = re.sub(r"\s*```$", "", raw)
+                    try:
+                        data = json.loads(raw)
+                        if data.get("url"):
+                            with _camps_conn() as c:
+                                c.execute("UPDATE camps SET registration_url=? WHERE id=?",
+                                         (data["url"], camp["id"]))
+                                c.commit()
+                            updated += 1
+                    except: pass
+        except Exception as e:
+            print(f"[camps] URL search error for {camp['camp_name']}: {e}")
+
+    return {"updated": updated}
+
+
+@app.post("/camps/nudge")
+async def nudge_camps(secret: str = ""):
+    """Send camp registration reminders. Called by cron."""
+    if secret != os.getenv("CRON_SECRET", "hearth-cron-2026"):
+        raise HTTPException(403, "Unauthorized")
+
+    from datetime import date, timedelta
+    today      = date.today()
+    in_3_days  = (today + timedelta(days=3)).isoformat()
+    in_14_days = (today + timedelta(days=14)).isoformat()
+    today_iso  = today.isoformat()
+    yesterday  = (today - timedelta(days=1)).isoformat()
+
+    with _camps_conn() as c:
+        camps_2w  = [dict(r) for r in c.execute(
+            "SELECT * FROM camps WHERE status='pending' AND registration_deadline=? AND nudge_sent_2w=0",
+            (in_14_days,)).fetchall()]
+        camps_3d  = [dict(r) for r in c.execute(
+            "SELECT * FROM camps WHERE status='pending' AND registration_deadline=? AND nudge_sent_3d=0",
+            (in_3_days,)).fetchall()]
+        camps_day = [dict(r) for r in c.execute(
+            "SELECT * FROM camps WHERE status='pending' AND registration_deadline=? AND nudge_sent_day=0",
+            (today_iso,)).fetchall()]
+        camps_confirm = [dict(r) for r in c.execute(
+            "SELECT * FROM camps WHERE status='pending' AND registration_deadline=? AND confirmed_registered=0",
+            (yesterday,)).fetchall()]
+
+    sent = 0
+    for camp in camps_2w:
+        tokens = _get_push_tokens(camp["user_id"])
+        child  = (" for " + camp["child_name"]) if camp.get("child_name") else ""
+        body   = camp["camp_name"] + child + " — registration closes " + camp["registration_deadline"]
+        _send_push(tokens, "⏰ Camp deadline in 2 weeks", body)
+        with _camps_conn() as c:
+            c.execute("UPDATE camps SET nudge_sent_2w=1 WHERE id=?", (camp["id"],))
+            c.commit()
+        sent += 1
+
+    for camp in camps_3d:
+        tokens = _get_push_tokens(camp["user_id"])
+        child  = (" for " + camp["child_name"]) if camp.get("child_name") else ""
+        body   = camp["camp_name"] + child + " — only 3 days left to register!"
+        _send_push(tokens, "🏕️ 3 days to register", body)
+        with _camps_conn() as c:
+            c.execute("UPDATE camps SET nudge_sent_3d=1 WHERE id=?", (camp["id"],))
+            c.commit()
+        sent += 1
+
+    for camp in camps_day:
+        tokens = _get_push_tokens(camp["user_id"])
+        child  = (" for " + camp["child_name"]) if camp.get("child_name") else ""
+        body   = "Last chance! " + camp["camp_name"] + child + " registration closes today."
+        _send_push(tokens, "🚨 Camp deadline today", body)
+        with _camps_conn() as c:
+            c.execute("UPDATE camps SET nudge_sent_day=1 WHERE id=?", (camp["id"],))
+            c.commit()
+        sent += 1
+
+    for camp in camps_confirm:
+        tokens = _get_push_tokens(camp["user_id"])
+        child  = (" for " + camp["child_name"]) if camp.get("child_name") else ""
+        body   = "Did you register" + child + " for " + camp["camp_name"] + "? Tap to confirm."
+        _send_push(tokens, "✅ Did you register?", body)
+        sent += 1
+
+    return {"nudges_sent": sent}
 
 if __name__ == "__main__":
     import uvicorn
