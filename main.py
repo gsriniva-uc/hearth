@@ -54,6 +54,9 @@ def startup():
     init_profiles()
     _init_push_tokens()
     _init_camps()
+    _upgrade_camps_table()
+    _init_camp_tasks()
+    _init_preferences()
     # Start background scheduler
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
@@ -2226,6 +2229,319 @@ async def nudge_camps(secret: str = ""):
         sent += 1
 
     return {"nudges_sent": sent}
+
+
+# ── User Preferences ──────────────────────────────────────────────────────────
+
+def _init_preferences():
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                user_id TEXT PRIMARY KEY,
+                mental_load_areas TEXT DEFAULT '["school","camps","medical","bills","kids_apps"]',
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        c.commit()
+
+@app.get("/user/preferences")
+def get_preferences(user_id: str):
+    from agent.calendar_agent import _conn
+    import json
+    with _conn() as c:
+        row = c.execute("SELECT * FROM user_preferences WHERE user_id=?", (user_id,)).fetchone()
+    if not row:
+        return {"mental_load_areas": ["school","camps","medical","bills","kids_apps"]}
+    return {"mental_load_areas": json.loads(row["mental_load_areas"])}
+
+@app.post("/user/preferences")
+async def save_preferences(request: Request):
+    import json
+    from agent.calendar_agent import _conn
+    body  = await request.json()
+    uid   = body.get("user_id","")
+    areas = body.get("mental_load_areas", ["school","camps","medical","bills","kids_apps"])
+    with _conn() as c:
+        c.execute("""
+            INSERT INTO user_preferences(user_id, mental_load_areas)
+            VALUES(?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+            mental_load_areas=excluded.mental_load_areas,
+            updated_at=datetime('now')
+        """, (uid, json.dumps(areas)))
+        c.commit()
+    return {"status": "saved"}
+
+
+# ── Camp Tasks ─────────────────────────────────────────────────────────────────
+
+def _init_camp_tasks():
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS camp_tasks (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     TEXT NOT NULL,
+                camp_id     INTEGER NOT NULL,
+                title       TEXT NOT NULL,
+                due_date    TEXT,
+                status      TEXT DEFAULT 'pending',
+                nudge_sent  INTEGER DEFAULT 0,
+                created_at  TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        c.commit()
+
+def _upgrade_camps_table():
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        for col, defn in [
+            ("camp_type",     "TEXT DEFAULT 'unknown'"),
+            ("app_name",      "TEXT"),
+            ("deep_link_url", "TEXT"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE camps ADD COLUMN {col} {defn}")
+                c.commit()
+                print(f"[camps] added column {col}")
+            except Exception:
+                pass
+
+
+PLATFORM_MAP = {
+    "campintouch":   ("Campanion",      "campanion://"),
+    "campanion":     ("Campanion",      "campanion://"),
+    "ultracamp":     ("UltraCamp",      "ultracamp://"),
+    "campbrain":     ("CampBrain",      None),
+    "jackrabbittech":("Jackrabbit",     "jackrabbit://"),
+    "challengecamp": ("Challenge Camp", "challengecamp://"),
+    "seesaw":        ("Seesaw",         "seesaw://"),
+    "classdojo":     ("ClassDojo",      "classdojo://"),
+    "remind":        ("Remind",         "remind://"),
+    "active":        ("Active",         None),
+}
+
+def _detect_platform(url: str):
+    if not url:
+        return None, None
+    url_lower = url.lower()
+    for key, (app_name, deep_link) in PLATFORM_MAP.items():
+        if key in url_lower:
+            return app_name, deep_link
+    return None, None
+
+def _infer_camp_type(camp_name: str) -> str:
+    name = camp_name.lower()
+    overnight_keywords = ["ramah","yavneh","overnight","sleepaway","residential",
+                          "sleep away","sleep-away","four week","six week","8 week"]
+    enrichment_keywords = ["music","dance","piano","violin","tutor","art studio",
+                           "theater","theatre","reading","language"]
+    day_keywords = ["code wiz","codewiz","coding","stem","science","robotics",
+                    "math","chess","lego","minecraft","roblox","soccer","swim",
+                    "tennis","gymnastics","cheer","tumbling","karate","martial"]
+    for k in overnight_keywords:
+        if k in name: return "overnight"
+    for k in day_keywords:
+        if k in name: return "day"
+    for k in enrichment_keywords:
+        if k in name: return "enrichment"
+    return "unknown"
+
+
+@app.post("/camps/{camp_id}/generate-tasks")
+async def generate_camp_tasks(camp_id: int, user_id: str):
+    import json
+    from datetime import date, timedelta
+    from agent.calendar_agent import _conn
+    import anthropic as ant
+
+    with _conn() as c:
+        camp = c.execute("SELECT * FROM camps WHERE id=? AND user_id=?",
+                         (camp_id, user_id)).fetchone()
+    if not camp:
+        return {"status": "not found"}
+    camp = dict(camp)
+
+    camp_type  = camp.get("camp_type") or _infer_camp_type(camp.get("camp_name",""))
+    start_date = camp.get("camp_start_date")
+    camp_name  = camp.get("camp_name","camp")
+    child      = camp.get("child_name","")
+
+    if camp_type == "enrichment":
+        return {"status": "no tasks needed", "tasks": []}
+
+    if camp_type == "unknown":
+        return {"status": "unknown camp type", "tasks": []}
+
+    today = date.today()
+
+    tasks_to_create = []
+
+    if camp_type == "overnight":
+        if start_date:
+            try:
+                start = date.fromisoformat(start_date)
+                days_until = (start - today).days
+                if days_until > 21:
+                    tasks_to_create.append({
+                        "title": f"Submit medical forms for {camp_name}",
+                        "due_date": (start - timedelta(days=21)).isoformat(),
+                    })
+                if days_until > 14:
+                    tasks_to_create.append({
+                        "title": f"Complete waivers & chugim for {camp_name}",
+                        "due_date": (start - timedelta(days=14)).isoformat(),
+                    })
+                if days_until > 7:
+                    tasks_to_create.append({
+                        "title": f"Start packing for {camp_name}",
+                        "due_date": (start - timedelta(days=7)).isoformat(),
+                    })
+            except: pass
+        else:
+            tasks_to_create.append({
+                "title": f"Submit medical forms for {camp_name}",
+                "due_date": None,
+            })
+            tasks_to_create.append({
+                "title": f"Complete waivers for {camp_name}",
+                "due_date": None,
+            })
+
+    elif camp_type == "day":
+        if start_date:
+            try:
+                start = date.fromisoformat(start_date)
+                days_until = (start - today).days
+                if days_until > 3:
+                    tasks_to_create.append({
+                        "title": f"Pack supplies for {camp_name}",
+                        "due_date": (start - timedelta(days=1)).isoformat(),
+                    })
+            except: pass
+
+    with _conn() as c:
+        existing = c.execute(
+            "SELECT title FROM camp_tasks WHERE camp_id=? AND user_id=?",
+            (camp_id, user_id)).fetchall()
+        existing_titles = {r["title"] for r in existing}
+
+    created = []
+    from agent.calendar_agent import _conn as conn
+    for t in tasks_to_create:
+        if t["title"] in existing_titles:
+            continue
+        with conn() as c:
+            c.execute(
+                "INSERT INTO camp_tasks(user_id,camp_id,title,due_date) VALUES(?,?,?,?)",
+                (user_id, camp_id, t["title"], t.get("due_date")))
+            c.commit()
+        created.append(t)
+
+    return {"status": "created", "tasks": created}
+
+
+@app.get("/camps/{camp_id}/tasks")
+def get_camp_tasks(camp_id: int, user_id: str):
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM camp_tasks WHERE camp_id=? AND user_id=? AND status='pending' ORDER BY due_date",
+            (camp_id, user_id)).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.put("/camp-tasks/{task_id}/done")
+def complete_camp_task(task_id: int, user_id: str):
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        c.execute("UPDATE camp_tasks SET status='done' WHERE id=? AND user_id=?",
+                  (task_id, user_id))
+        c.commit()
+    return {"status": "done"}
+
+
+# ── Actions Briefing ───────────────────────────────────────────────────────────
+
+@app.post("/actions/briefing")
+async def actions_briefing(request: Request):
+    import json, anthropic as ant
+    from datetime import date, timedelta
+    from agent.calendar_agent import _conn
+
+    body    = await request.json()
+    user_id = body.get("user_id","")
+    today   = date.today().isoformat()
+    in_7d   = (date.today() + timedelta(days=7)).isoformat()
+    in_30d  = (date.today() + timedelta(days=30)).isoformat()
+
+    prefs = get_preferences(user_id)
+    areas = prefs.get("mental_load_areas", ["school","camps","medical","bills","kids_apps"])
+
+    data = {}
+
+    if "camps" in areas:
+        with _conn() as c:
+            data["camps"] = [dict(r) for r in c.execute(
+                "SELECT * FROM camps WHERE user_id=? AND status='pending' ORDER BY registration_deadline",
+                (user_id,)).fetchall()]
+            data["camp_tasks"] = [dict(r) for r in c.execute(
+                """SELECT ct.*, c.camp_name, c.app_name, c.deep_link_url
+                   FROM camp_tasks ct JOIN camps c ON ct.camp_id=c.id
+                   WHERE ct.user_id=? AND ct.status='pending' ORDER BY ct.due_date""",
+                (user_id,)).fetchall()]
+
+    if "bills" in areas:
+        with _conn() as c:
+            data["bills"] = [dict(r) for r in c.execute(
+                "SELECT * FROM tasks WHERE user_id=? AND task_type='bill' AND status='pending' ORDER BY due_date",
+                (user_id,)).fetchall()]
+
+    if "medical" in areas:
+        with _conn() as c:
+            data["medical"] = [dict(r) for r in c.execute(
+                "SELECT * FROM tasks WHERE user_id=? AND task_type IN ('draft','followup') AND status='pending' ORDER BY due_date",
+                (user_id,)).fetchall()]
+
+    prompt = f"""You are Hearth, a family concierge AI. Today is {today}.
+
+Here is the family's actionable data:
+{json.dumps(data, indent=2, default=str)}
+
+Generate a daily briefing of items that require the parent to take action.
+Rules:
+- ONLY include items where the parent needs to DO something
+- Do NOT include calendar events or informational items
+- Sort by urgency (most urgent first)
+- Maximum 6 items
+
+Return ONLY a JSON array:
+[{{
+  "urgency": "high" | "medium" | "low",
+  "title": "short clear title",
+  "subtitle": "one line of context — why it matters or when",
+  "action_label": "Pay Now" | "Open App" | "Draft Email" | "Register" | "Submit" | "Done" | null,
+  "action_url": "https://... or null",
+  "app_name": "Campanion" | null,
+  "deep_link_url": "campanion:// or null",
+  "item_type": "camp" | "bill" | "medical" | "camp_task",
+  "item_id": 123
+}}]
+
+Only return JSON array. No other text."""
+
+    try:
+        client = ant.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+        resp   = client.messages.create(
+            model=cfg.CLAUDE_MODEL, max_tokens=1500,
+            messages=[{"role":"user","content":prompt}])
+        raw  = re.sub(r"^```json\s*","",resp.content[0].text.strip())
+        raw  = re.sub(r"\s*```$","",raw)
+        items = json.loads(raw)
+        return {"items": items, "error": None}
+    except Exception as e:
+        return {"items": [], "error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
