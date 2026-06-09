@@ -538,8 +538,8 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
               "\"art show\" OR \"picture day\" OR \"early dismissal\" OR "
               "\"field trip\" OR \"dress down\" OR \"spirit day\" OR "
               "\"school closed\" OR \"half day\" OR \"parent teacher\" OR "
-              "\"              "\"summer camp\" OR \"camp registration\" OR \"camp enrollment\" OR "
-              "\"              "\"camp forms\" OR \"camp orientation\" OR camper OR Campanion))"
+              "\"summer camp\" OR \"camp registration\" OR \"camp enrollment\" OR "
+              "\"camp forms\" OR \"camp orientation\" OR camper OR Campanion))"
     )
     # Pass 2 — recent emails regardless of subject
     query2 = "after:" + after
