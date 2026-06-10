@@ -338,6 +338,9 @@ def _sync_gcal_to_db(user_id: str, email: str) -> dict:
             etype = "sports_game"
         elif any(k in s for k in ["piano","music","art","tutor","drama","activity","class"]):
             etype = "activity"
+        elif any(k in s for k in ["teacher gift","fundraiser","book fair","pta donation",
+                                      "class gift","contribution","donate","spirit wear"]):
+            etype = "school_fundraiser"
         elif any(k in s for k in ["bill","payment","invoice","due","renewal","insurance"]):
             etype = "bill"
         else:
@@ -602,8 +605,8 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
         "Return JSON array:\n"
         "[{\"child_name\":\"...\",\"event_type\":\"...\","
         "\"event_date\":\"YYYY-MM-DD\",\"event_time\":null,\"notes\":\"...\"}]\n"
-        "Valid event_type: dress_down_day,early_dismissal,recital,field_trip,"
-        "special_day,doctor_appointment,sports_game,school_holiday,activity,bill,other\n"
+        "Use school_fundraiser for: teacher gifts, PTA donations, book fairs, class contributions, spirit wear, fundraising requests from school.\n""Use bill ONLY for: utility bills, credit cards, insurance invoices, subscription renewals from companies — NOT school contribution requests.\n""Valid event_type: dress_down_day,early_dismissal,recital,field_trip,"
+        "special_day,doctor_appointment,sports_game,school_holiday,activity,bill,school_fundraiser,other\n"
         "Emails:\n" + digest[:5000] + "\nONLY JSON array."
     )
 
