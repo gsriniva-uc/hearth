@@ -57,6 +57,9 @@ def startup():
     _upgrade_camps_table()
     _init_camp_tasks()
     _init_preferences()
+    _upgrade_camps_table_v2()
+    _init_camp_checklist()
+    _init_prescriptions()
     # Start background scheduler
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
@@ -2544,6 +2547,326 @@ Only return JSON array. No other text."""
         return {"items": items, "error": None}
     except Exception as e:
         return {"items": [], "error": str(e)}
+
+
+# ── Camp checklist & setup extensions ─────────────────────────────────────────
+
+def _upgrade_camps_table_v2():
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        for col, defn in [
+            ("orientation_date",        "TEXT"),
+            ("bus_needed",              "INTEGER DEFAULT 0"),
+            ("meals_needed",            "INTEGER DEFAULT 0"),
+            ("packing_list",            "TEXT"),
+            ("class_selection_deadline","TEXT"),
+            ("payment_schedule",        "TEXT"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE camps ADD COLUMN {col} {defn}")
+                c.commit()
+                print(f"[camps_v2] added {col}")
+            except:
+                pass
+
+def _init_camp_checklist():
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS camp_checklist (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      TEXT NOT NULL,
+                camp_id      INTEGER NOT NULL,
+                item_type    TEXT NOT NULL,
+                title        TEXT NOT NULL,
+                due_date     TEXT,
+                status       TEXT DEFAULT 'pending',
+                auto_trigger TEXT,
+                created_at   TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        c.commit()
+
+def _init_prescriptions():
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS prescriptions (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      TEXT NOT NULL,
+                child_name   TEXT,
+                medication   TEXT NOT NULL,
+                frequency    TEXT,
+                notes        TEXT,
+                created_at   TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        c.commit()
+
+
+@app.get("/user/setup-status")
+def get_setup_status(user_id: str):
+    """Returns completion status per mental load area."""
+    import json
+    from agent.calendar_agent import _conn
+
+    prefs = get_preferences(user_id)
+    areas = prefs.get("mental_load_areas", [])
+
+    status = {}
+
+    if "camps" in areas:
+        with _conn() as c:
+            camps = [dict(r) for r in c.execute(
+                "SELECT * FROM camps WHERE user_id=?", (user_id,)).fetchall()]
+        incomplete = [c for c in camps if not c.get("camp_start_date") or not c.get("orientation_date")]
+        status["camps"] = {
+            "count": len(camps),
+            "incomplete": len(incomplete),
+            "label": f"{len(camps)} camp(s) added" + (f" · {len(incomplete)} incomplete" if incomplete else " · complete") if camps else "Not set up yet"
+        }
+
+    if "medical" in areas:
+        with _conn() as c:
+            rxs = c.execute("SELECT * FROM prescriptions WHERE user_id=?", (user_id,)).fetchall()
+        status["medical"] = {
+            "count": len(rxs),
+            "label": f"{len(rxs)} prescription(s) tracked" if rxs else "Not set up yet"
+        }
+
+    if "school" in areas:
+        with _conn() as c:
+            kids = [dict(r) for r in c.execute(
+                "SELECT * FROM children WHERE user_id=?", (user_id,)).fetchall()]
+        status["school"] = {
+            "count": len(kids),
+            "label": ", ".join(k["name"] for k in kids) if kids else "Not set up yet"
+        }
+
+    if "bills" in areas:
+        status["bills"] = {"label": "Gmail scan active"}
+
+    if "kids_apps" in areas:
+        with _conn() as c:
+            camps_with_apps = [dict(r) for r in c.execute(
+                "SELECT DISTINCT app_name FROM camps WHERE user_id=? AND app_name IS NOT NULL",
+                (user_id,)).fetchall()]
+        app_names = [r["app_name"] for r in camps_with_apps if r["app_name"]]
+        status["kids_apps"] = {
+            "label": ", ".join(app_names) if app_names else "No apps detected yet"
+        }
+
+    return {"areas": areas, "status": status}
+
+
+@app.post("/camps/{camp_id}/checklist/generate")
+async def generate_camp_checklist(camp_id: int, user_id: str):
+    """Generate checklist items for a camp."""
+    import json
+    from datetime import date, timedelta
+    from agent.calendar_agent import _conn
+
+    with _conn() as c:
+        camp = c.execute("SELECT * FROM camps WHERE id=? AND user_id=?",
+                         (camp_id, user_id)).fetchone()
+    if not camp:
+        return {"status": "not found"}
+    camp = dict(camp)
+
+    child      = camp.get("child_name", "")
+    camp_name  = camp.get("camp_name", "camp")
+    camp_type  = camp.get("camp_type") or _infer_camp_type(camp_name)
+    start_date = camp.get("camp_start_date")
+    deadline   = camp.get("registration_deadline")
+    orientation= camp.get("orientation_date")
+
+    items = []
+    today = date.today()
+
+    # Registration
+    items.append({
+        "item_type": "registration",
+        "title": "Register for " + camp_name,
+        "due_date": deadline,
+        "auto_trigger": "registration_url_opened"
+    })
+
+    # Orientation
+    if orientation:
+        items.append({
+            "item_type": "calendar",
+            "title": "Add orientation to calendar",
+            "due_date": orientation,
+            "auto_trigger": "gcal_written"
+        })
+
+    # Camp dates on calendar
+    if start_date:
+        items.append({
+            "item_type": "calendar",
+            "title": "Add camp dates to calendar",
+            "due_date": start_date,
+            "auto_trigger": "gcal_written"
+        })
+
+    # Medical forms — check last doctor visit for this child
+    if camp_type in ["overnight", "unknown"] and child:
+        with _conn() as c:
+            last_appt = c.execute(
+                """SELECT event_date FROM events
+                   WHERE user_id=? AND event_type='doctor_appointment'
+                   AND (child_name=? OR child_name='all')
+                   ORDER BY event_date DESC LIMIT 1""",
+                (user_id, child)).fetchone()
+        if last_appt:
+            try:
+                last_dt   = date.fromisoformat(last_appt["event_date"])
+                months_ago = (today - last_dt).days / 30
+                if months_ago > 11:
+                    items.append({
+                        "item_type": "medical",
+                        "title": f"Schedule physical for {child} — last was {round(months_ago)}mo ago",
+                        "due_date": (date.fromisoformat(start_date) - timedelta(days=14)).isoformat() if start_date else None,
+                        "auto_trigger": None
+                    })
+                else:
+                    items.append({
+                        "item_type": "medical",
+                        "title": f"Submit medical forms for {camp_name}",
+                        "due_date": (date.fromisoformat(start_date) - timedelta(days=21)).isoformat() if start_date else None,
+                        "auto_trigger": None
+                    })
+            except:
+                pass
+        else:
+            items.append({
+                "item_type": "medical",
+                "title": f"Schedule physical for {child} — no recent visit found",
+                "due_date": None,
+                "auto_trigger": None
+            })
+
+    # Bus / meals
+    if camp.get("bus_needed"):
+        items.append({
+            "item_type": "logistics",
+            "title": "Sign up for bus",
+            "due_date": deadline,
+            "auto_trigger": None
+        })
+    if camp.get("meals_needed"):
+        items.append({
+            "item_type": "logistics",
+            "title": "Sign up for meals",
+            "due_date": deadline,
+            "auto_trigger": None
+        })
+
+    # Packing list reminder
+    if start_date:
+        try:
+            pack_date = (date.fromisoformat(start_date) - timedelta(days=2)).isoformat()
+            items.append({
+                "item_type": "packing",
+                "title": "Prepare packing list for " + camp_name,
+                "due_date": pack_date,
+                "auto_trigger": None
+            })
+        except: pass
+
+    # Save to DB — skip duplicates
+    with _conn() as c:
+        existing = {r["item_type"] + r["title"]
+                    for r in c.execute(
+                        "SELECT item_type, title FROM camp_checklist WHERE camp_id=? AND user_id=?",
+                        (camp_id, user_id)).fetchall()}
+        for item in items:
+            key = item["item_type"] + item["title"]
+            if key not in existing:
+                c.execute(
+                    "INSERT INTO camp_checklist(user_id,camp_id,item_type,title,due_date,auto_trigger) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (user_id, camp_id, item["item_type"], item["title"],
+                     item.get("due_date"), item.get("auto_trigger")))
+        c.commit()
+
+    return {"status": "ok", "items_created": len(items)}
+
+
+@app.get("/camps/{camp_id}/checklist")
+def get_camp_checklist(camp_id: int, user_id: str):
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM camp_checklist WHERE camp_id=? AND user_id=? ORDER BY due_date",
+            (camp_id, user_id)).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.put("/camp-checklist/{item_id}/done")
+def complete_checklist_item(item_id: int, user_id: str):
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        c.execute("UPDATE camp_checklist SET status='done' WHERE id=? AND user_id=?",
+                  (item_id, user_id))
+        c.commit()
+    return {"status": "done"}
+
+
+@app.post("/prescriptions")
+async def save_prescription(request: Request):
+    import json
+    from agent.calendar_agent import _conn
+    import anthropic as ant
+    body = await request.json()
+    user_id = body.get("user_id", "")
+    child   = body.get("child_name", "")
+    text    = body.get("text", "")
+
+    if not text:
+        return {"prescriptions": [], "error": "No text"}
+
+    prompt = (
+        "Extract prescription/medication details from this text.\n"
+        "Child: " + child + "\n"
+        "Text: " + text + "\n\n"
+        "Return ONLY a JSON array:\n"
+        "[{\n"
+        "  \"medication\": \"name\",\n"
+        "  \"frequency\": \"daily/weekly/as needed\",\n"
+        "  \"notes\": \"any extra info or null\"\n"
+        "}]\n"
+        "ONLY JSON."
+    )
+    try:
+        client = ant.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+        resp   = client.messages.create(
+            model=cfg.CLAUDE_MODEL, max_tokens=500,
+            messages=[{"role": "user", "content": prompt}])
+        raw  = re.sub(r"^```json\s*", "", resp.content[0].text.strip())
+        raw  = re.sub(r"\s*```$", "", raw)
+        meds = json.loads(raw)
+        with _conn() as c:
+            for med in meds:
+                c.execute(
+                    "INSERT INTO prescriptions(user_id,child_name,medication,frequency,notes) "
+                    "VALUES(?,?,?,?,?)",
+                    (user_id, child, med.get("medication",""),
+                     med.get("frequency",""), med.get("notes","")))
+            c.commit()
+        return {"prescriptions": meds, "error": None}
+    except Exception as e:
+        return {"prescriptions": [], "error": str(e)}
+
+
+@app.get("/prescriptions")
+def get_prescriptions(user_id: str):
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT * FROM prescriptions WHERE user_id=? ORDER BY child_name, medication",
+            (user_id,)).fetchall()
+    return [dict(r) for r in rows]
 
 if __name__ == "__main__":
     import uvicorn
