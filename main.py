@@ -2637,7 +2637,7 @@ def get_setup_status(user_id: str):
     if "school" in areas:
         with _conn() as c:
             kids = [dict(r) for r in c.execute(
-                "SELECT * FROM children WHERE user_id=?", (user_id,)).fetchall()]
+                "SELECT * FROM profiles WHERE user_id=?", (user_id,)).fetchall()]
         status["school"] = {
             "count": len(kids),
             "label": ", ".join(k["name"] for k in kids) if kids else "Not set up yet"
