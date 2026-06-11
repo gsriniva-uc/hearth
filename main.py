@@ -1025,6 +1025,21 @@ def gmail_scan_all(user_id: str):
             total_new     += r.get("new", 0)
             total_skipped += r.get("skipped", 0)
             accounts_ok   += 1
+    # Run lifecycle check for pending/registered camps
+    try:
+        from agent.calendar_agent import _conn as _lc_conn
+        with _lc_conn() as c:
+            lc_camps = [dict(r) for r in c.execute(
+                "SELECT * FROM camps WHERE user_id=? AND status IN ('pending','registered')",
+                (user_id,)).fetchall()]
+        for lc_camp in lc_camps:
+            try:
+                _check_camp_lifecycle(user_id, lc_camp)
+            except Exception as e:
+                print("[lifecycle scan] camp " + str(lc_camp.get("id")) + ": " + str(e))
+    except Exception as e:
+        print("[lifecycle scan] " + str(e))
+
     return {"new": total_new, "skipped": total_skipped,
             "accounts_scanned": accounts_ok,
             "errors": errors, "error": None}
@@ -2320,6 +2335,7 @@ def _upgrade_camps_table():
 PLATFORM_MAP = {
     "campintouch":   ("Campanion",      "campanion://"),
     "campanion":     ("Campanion",      "campanion://"),
+    "campdoc":       ("CampDoc",        None),
     "ultracamp":     ("UltraCamp",      "ultracamp://"),
     "campbrain":     ("CampBrain",      None),
     "jackrabbittech":("Jackrabbit",     "jackrabbit://"),
@@ -2564,6 +2580,8 @@ def _upgrade_camps_table_v2():
             ("packing_list",            "TEXT"),
             ("class_selection_deadline","TEXT"),
             ("payment_schedule",        "TEXT"),
+            ("next_action",             "TEXT"),
+            ("lifecycle_checked_at",    "TEXT"),
         ]:
             try:
                 c.execute(f"ALTER TABLE camps ADD COLUMN {col} {defn}")
@@ -2870,6 +2888,170 @@ def get_prescriptions(user_id: str):
             "SELECT * FROM prescriptions WHERE user_id=? ORDER BY child_name, medication",
             (user_id,)).fetchall()
     return [dict(r) for r in rows]
+
+
+
+# ── Camp lifecycle detection ────────────────────────────────────────────────
+
+CAMP_LIFECYCLE_KEYWORDS = (
+    "registered OR confirmation OR confirmed OR receipt OR welcome OR "
+    "\"class selection\" OR \"course selection\" OR \"forms\" OR "
+    "orientation OR \"what to bring\" OR \"pick-up\" OR \"pickup\" OR "
+    "medical OR camper OR counselor OR waitlist OR payment"
+)
+
+def _check_camp_lifecycle(user_id: str, camp: dict) -> dict:
+    """Search Gmail for lifecycle signals for a single camp and update its record."""
+    from googleapiclient.discovery import build
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from agent.calendar_agent import _conn
+    import anthropic as ant
+
+    camp_id   = camp["id"]
+    camp_name = camp.get("camp_name", "")
+    if not camp_name:
+        return {"updated": False, "error": "no camp name"}
+
+    emails = _list_connected_emails(user_id)
+    if not emails:
+        return {"updated": False, "error": "no gmail connected"}
+
+    matched_emails = []
+    for email in emails:
+        token_data = _load_token(user_id, email)
+        if not token_data:
+            continue
+        creds = Credentials(
+            token=token_data.get("access_token"),
+            refresh_token=token_data.get("refresh_token"),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+        )
+        if not creds.valid and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                token_data["access_token"] = creds.token
+                _save_token(user_id, email, token_data)
+            except Exception:
+                continue
+
+        service = build("gmail", "v1", credentials=creds)
+        query = '"' + camp_name + '" (' + CAMP_LIFECYCLE_KEYWORDS + ')'
+        try:
+            result   = service.users().messages().list(
+                userId="me", q=query, maxResults=10).execute()
+            messages = result.get("messages", [])
+        except Exception as e:
+            print("[lifecycle search] " + str(e))
+            continue
+
+        def extract_body(payload):
+            data = payload.get("body", {}).get("data", "")
+            if data and "text" in payload.get("mimeType", ""):
+                try: return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                except: return ""
+            for part in payload.get("parts", []):
+                t = extract_body(part)
+                if t: return t
+            return ""
+
+        for msg in messages[:8]:
+            try:
+                full    = service.users().messages().get(
+                    userId="me", id=msg["id"], format="full").execute()
+                headers = full["payload"].get("headers", [])
+                subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
+                date_h  = next((h["value"] for h in headers if h["name"] == "Date"), "")
+                body    = extract_body(full["payload"])[:1500]
+                if subject:
+                    matched_emails.append({"subject": subject, "body": body, "date": date_h})
+            except Exception:
+                continue
+
+    if not matched_emails:
+        return {"updated": False, "found_emails": 0}
+
+    digest = "\n".join(
+        "--- " + e["subject"] + " (" + e.get("date","") + ") ---\n" + e["body"]
+        for e in matched_emails)
+
+    today_iso = __import__("datetime").date.today().isoformat()
+
+    prompt = (
+        "You are Hearth, a family concierge AI. Today is " + today_iso + ".\n"
+        "Camp name: " + camp_name + "\n"
+        "Camp type: " + (camp.get("camp_type") or "unknown") + "\n\n"
+        "Here are emails mentioning this camp:\n" + digest[:4000] + "\n\n"
+        "Determine the registration/lifecycle status. "
+        "IMPORTANT: if ANY email implies registration is already complete "
+        "(class selections, forms to fill out, orientation details, medical forms, "
+        "pickup authorization, camper/counselor info, 'what to bring') then "
+        "is_registered must be true, even if no explicit confirmation email exists.\n\n"
+        "Return ONLY JSON:\n"
+        "{\n"
+        '  "is_registered": true or false,\n'
+        '  "current_stage": "registered" | "class_selection_pending" | '
+        '"forms_pending" | "orientation_known" | "ready" | "unknown",\n'
+        '  "next_action": "short specific next step with deadline if mentioned, or null",\n'
+        '  "forms_deadline": "YYYY-MM-DD or null",\n'
+        '  "platform_mentioned": "Campanion" | "CampDoc" | "UltraCamp" | "CampBrain" | null\n'
+        "}\n"
+        "ONLY JSON, no other text."
+    )
+
+    try:
+        client = ant.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+        resp   = client.messages.create(
+            model=cfg.CLAUDE_MODEL, max_tokens=400,
+            messages=[{"role": "user", "content": prompt}])
+        raw  = re.sub(r"^```json\s*", "", resp.content[0].text.strip())
+        raw  = re.sub(r"\s*```$", "", raw)
+        data = json.loads(raw)
+    except Exception as e:
+        return {"updated": False, "error": str(e)}
+
+    updates  = {}
+    new_status = "registered" if data.get("is_registered") else camp.get("status")
+    if new_status != camp.get("status"):
+        updates["status"] = new_status
+
+    if data.get("next_action"):
+        updates["next_action"] = data["next_action"]
+
+    platform = data.get("platform_mentioned")
+    if platform and not camp.get("app_name"):
+        for key, (app_name, deep_link) in PLATFORM_MAP.items():
+            if app_name.lower() == platform.lower():
+                updates["app_name"] = app_name
+                if deep_link:
+                    updates["deep_link_url"] = deep_link
+                break
+
+    updates["lifecycle_checked_at"] = __import__("datetime").datetime.now().isoformat()
+
+    if updates:
+        set_clause = ", ".join(k + "=?" for k in updates.keys())
+        with _conn() as c:
+            c.execute("UPDATE camps SET " + set_clause + " WHERE id=? AND user_id=?",
+                      list(updates.values()) + [camp_id, user_id])
+            c.commit()
+
+    return {"updated": True, "found_emails": len(matched_emails), **data}
+
+
+@app.post("/camps/{camp_id}/check-status")
+def check_camp_status(camp_id: int, user_id: str):
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        camp = c.execute("SELECT * FROM camps WHERE id=? AND user_id=?",
+                         (camp_id, user_id)).fetchone()
+    if not camp:
+        return {"status": "not found"}
+    result = _check_camp_lifecycle(user_id, dict(camp))
+    return result
 
 if __name__ == "__main__":
     import uvicorn
