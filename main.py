@@ -2542,7 +2542,7 @@ Rules:
 - ONLY include items where the parent needs to DO something
 - Do NOT include calendar events or informational items
 - For registered_camps_with_next_steps, create an item using the next_action text as the title.
-  If app_name is set, set action_label to "Open {app_name}", app_name, and deep_link_url accordingly.
+  If app_name is set, set action_label to "Open {{app_name}}", app_name, and deep_link_url accordingly.
   Otherwise set action_label appropriately (e.g. "View details") with action_url null.
   Use item_type "camp" and item_id = the camp's id.
 - Sort by urgency (most urgent first)
