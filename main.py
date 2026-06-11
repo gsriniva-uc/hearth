@@ -3053,6 +3053,67 @@ def check_camp_status(camp_id: int, user_id: str):
     result = _check_camp_lifecycle(user_id, dict(camp))
     return result
 
+
+
+@app.post("/camps/{camp_id}/check-status-debug")
+def check_camp_status_debug(camp_id: int, user_id: str):
+    from googleapiclient.discovery import build
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from agent.calendar_agent import _conn
+
+    with _conn() as c:
+        camp = c.execute("SELECT * FROM camps WHERE id=? AND user_id=?",
+                         (camp_id, user_id)).fetchone()
+    if not camp:
+        return {"status": "not found"}
+    camp = dict(camp)
+    camp_name = camp.get("camp_name", "")
+
+    emails = _list_connected_emails(user_id)
+    debug_info = {"camp_name": camp_name, "emails_checked": [], "query": None}
+
+    query = "\"" + camp_name + "\" (" + CAMP_LIFECYCLE_KEYWORDS + ")"
+    debug_info["query"] = query
+
+    for email in emails:
+        entry = {"email": email}
+        token_data = _load_token(user_id, email)
+        if not token_data:
+            entry["error"] = "no token"
+            debug_info["emails_checked"].append(entry)
+            continue
+        creds = Credentials(
+            token=token_data.get("access_token"),
+            refresh_token=token_data.get("refresh_token"),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+        )
+        if not creds.valid and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                token_data["access_token"] = creds.token
+                _save_token(user_id, email, token_data)
+            except Exception as e:
+                entry["refresh_error"] = str(e)
+                debug_info["emails_checked"].append(entry)
+                continue
+
+        service = build("gmail", "v1", credentials=creds)
+        try:
+            result   = service.users().messages().list(
+                userId="me", q=query, maxResults=10).execute()
+            messages = result.get("messages", [])
+            entry["messages_found"] = len(messages)
+            entry["resultSizeEstimate"] = result.get("resultSizeEstimate")
+        except Exception as e:
+            entry["search_error"] = str(e)
+        debug_info["emails_checked"].append(entry)
+
+    return debug_info
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=cfg.API_PORT, reload=True)
