@@ -2510,6 +2510,10 @@ async def actions_briefing(request: Request):
             data["camps"] = [dict(r) for r in c.execute(
                 "SELECT * FROM camps WHERE user_id=? AND status='pending' ORDER BY registration_deadline",
                 (user_id,)).fetchall()]
+            data["registered_camps_with_next_steps"] = [dict(r) for r in c.execute(
+                "SELECT id, camp_name, child_name, next_action, app_name, deep_link_url "
+                "FROM camps WHERE user_id=? AND status='registered' AND next_action IS NOT NULL",
+                (user_id,)).fetchall()]
             data["camp_tasks"] = [dict(r) for r in c.execute(
                 """SELECT ct.*, c.camp_name, c.app_name, c.deep_link_url
                    FROM camp_tasks ct JOIN camps c ON ct.camp_id=c.id
@@ -2537,6 +2541,10 @@ Generate a daily briefing of items that require the parent to take action.
 Rules:
 - ONLY include items where the parent needs to DO something
 - Do NOT include calendar events or informational items
+- For registered_camps_with_next_steps, create an item using the next_action text as the title.
+  If app_name is set, set action_label to "Open {app_name}", app_name, and deep_link_url accordingly.
+  Otherwise set action_label appropriately (e.g. "View details") with action_url null.
+  Use item_type "camp" and item_id = the camp's id.
 - Sort by urgency (most urgent first)
 - Maximum 6 items
 
