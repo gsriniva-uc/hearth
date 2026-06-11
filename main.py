@@ -2590,6 +2590,7 @@ def _upgrade_camps_table_v2():
             ("payment_schedule",        "TEXT"),
             ("next_action",             "TEXT"),
             ("lifecycle_checked_at",    "TEXT"),
+            ("dismissed_action",        "TEXT"),
         ]:
             try:
                 c.execute(f"ALTER TABLE camps ADD COLUMN {col} {defn}")
@@ -3026,8 +3027,17 @@ def _check_camp_lifecycle(user_id: str, camp: dict) -> dict:
     if new_status != camp.get("status"):
         updates["status"] = new_status
 
-    if data.get("next_action"):
-        updates["next_action"] = data["next_action"]
+    new_action = data.get("next_action")
+    dismissed  = camp.get("dismissed_action")
+    if new_action:
+        if dismissed and new_action.strip() == dismissed.strip():
+            # Same action already dismissed by user — don't re-surface
+            pass
+        else:
+            updates["next_action"] = new_action
+            if dismissed:
+                # A genuinely new action appeared — clear old dismissal
+                updates["dismissed_action"] = None
 
     platform = data.get("platform_mentioned")
     if platform and not camp.get("app_name"):
@@ -3121,6 +3131,23 @@ def check_camp_status_debug(camp_id: int, user_id: str):
         debug_info["emails_checked"].append(entry)
 
     return debug_info
+
+
+
+@app.post("/camps/{camp_id}/dismiss-action")
+def dismiss_camp_action(camp_id: int, user_id: str):
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        camp = c.execute("SELECT next_action FROM camps WHERE id=? AND user_id=?",
+                         (camp_id, user_id)).fetchone()
+        if not camp:
+            return {"status": "not found"}
+        current_action = camp["next_action"]
+        c.execute(
+            "UPDATE camps SET dismissed_action=?, next_action=NULL WHERE id=? AND user_id=?",
+            (current_action, camp_id, user_id))
+        c.commit()
+    return {"status": "dismissed", "dismissed_action": current_action}
 
 if __name__ == "__main__":
     import uvicorn
