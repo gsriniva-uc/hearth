@@ -2573,6 +2573,8 @@ Only return JSON array. No other text."""
         items = json.loads(raw)
         return {"items": items, "error": None}
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {"items": [], "error": str(e)}
 
 
