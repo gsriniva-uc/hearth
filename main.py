@@ -683,7 +683,7 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
             body = extract_body(full["payload"])
             if body:
                 emails_data.append({"subject": m["subject"], "from": m["from"],
-                                     "body": body[:5000], "received": m["date"]})
+                                     "body": body[:1200], "received": m["date"]})
         except Exception:
             continue
 
@@ -728,7 +728,7 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
         "statements unrelated to the kids.\n"
         "Always preserve the sender's actual organization name in org_name (e.g. "
         "'Inventure Academy', not 'your school').\n"
-        "Emails:\n" + digest[:6000] + "\nONLY JSON array."
+        "Emails:\n" + digest[:30000] + "\nONLY JSON array."
     )
 
     client = ant.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
