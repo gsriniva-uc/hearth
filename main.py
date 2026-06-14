@@ -690,6 +690,11 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
     if not emails_data:
         return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
 
+    print("[gmail extract] emails included: " + str([e["subject"][:60] for e in emails_data]))
+    print("[gmail extract] keyword_ids=" + str(len(keyword_ids)) +
+          " allowlisted=" + str(len(allowlisted_ids)) +
+          " triage=" + str(len(triage_ids)))
+
     children_str = ", ".join(get_children(user_id)) or "the children"
     today_str    = date.today().strftime("%A, %B %d, %Y")
     today_iso    = date.today().isoformat()
