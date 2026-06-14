@@ -767,8 +767,8 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
             new += 1
             continue
 
-        child = item.get("child_name", "all")
-        etype = item.get("event_type", "other")
+        child = item.get("child_name") or "all"
+        etype = item.get("event_type") or "other"
         edate = item.get("event_date", "")
         if not edate: continue
         if _event_exists(user_id, child, etype, edate): skipped += 1; continue
