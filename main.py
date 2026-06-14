@@ -809,9 +809,11 @@ def _scan_bill_emails(user_id: str, email: str, days_back: int = 30) -> dict:
     bill_query = (
         "after:" + after + " "
         "(subject:(invoice OR outstanding OR \"payment due\" OR \"bill is ready\" "
-        "OR \"amount due\" OR \"statement available\" OR \"your bill\" "
+        "OR \"amount due\" OR \"statement available\" OR \"statement is ready\" "
+        "OR \"statement ready\" OR \"your statement\" OR \"your bill\" "
         "OR \"balance due\" OR \"minimum payment\" OR \"auto pay\" "
-        "OR autopay OR pledge OR \"payment reminder\" OR \"amount owed\"))"
+        "OR autopay OR pledge OR \"payment reminder\" OR \"amount owed\" "
+        "OR \"card statement\"))"
     )
     result   = service.users().messages().list(userId="me", q=bill_query, maxResults=30).execute()
     messages = result.get("messages", [])
