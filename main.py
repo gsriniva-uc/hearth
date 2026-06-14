@@ -732,7 +732,10 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
     raw    = re.sub(r"^```json\s*", "", resp.content[0].text.strip())
     raw    = re.sub(r"\s*```$", "", raw)
     try:    items = json.loads(raw)
-    except Exception: items = []
+    except Exception:
+        items = []
+        print("[gmail extract] JSON parse failed. Raw response: " + raw[:1000])
+    print("[gmail extract] " + str(len(emails_data)) + " emails sent, " + str(len(items)) + " items returned")
 
     new = skipped = 0
     for item in items:
