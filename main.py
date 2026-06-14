@@ -2696,6 +2696,9 @@ Generate a daily briefing of items that require the parent to take action.
 Rules:
 - ONLY include items where the parent needs to DO something
 - Do NOT include calendar events or informational items
+- For school_tasks, create an item using the task title as the title, with org name (contact_name)
+  and due_date (if any) in the subtitle. Use action_label "View details" with action_url null,
+  unless the task clearly implies a link/registration. item_type "school_task", item_id = task id.
 - For registered_camps_with_next_steps, create an item using the next_action text as the title.
   If app_name is set, set action_label to "Open {{app_name}}", app_name, and deep_link_url accordingly.
   Otherwise set action_label appropriately (e.g. "View details") with action_url null.
