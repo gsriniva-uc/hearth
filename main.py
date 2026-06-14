@@ -3153,6 +3153,64 @@ def dismiss_camp_action(camp_id: int, user_id: str):
         c.commit()
     return {"status": "dismissed", "dismissed_action": current_action}
 
+
+
+@app.post("/gmail/scan-debug-v3")
+def gmail_scan_debug_v3(user_id: str):
+    """Show subjects of emails matched by the real scan query."""
+    from googleapiclient.discovery import build
+    from datetime import date, timedelta
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+
+    emails_list = _list_connected_emails(user_id)
+    if not emails_list:
+        return {"error": "No Gmail connected"}
+
+    all_subjects = []
+    for email in emails_list:
+        token_data = _load_token(user_id, email)
+        if not token_data:
+            continue
+        creds = Credentials(
+            token=token_data.get("access_token"),
+            refresh_token=token_data.get("refresh_token"),
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+        )
+        if not creds.valid and creds.refresh_token:
+            creds.refresh(Request())
+        service = build("gmail", "v1", credentials=creds)
+        after = (date.today() - timedelta(days=30)).strftime("%Y/%m/%d")
+        query1 = ("after:" + after + " (subject:(reminder OR newsletter OR RSVP OR "
+                  "cheerleading OR performance OR appointment OR invoice OR payment OR "
+                  "festival OR recital OR dismissal OR activity OR birthday OR show OR "
+                  "concert OR \"no school\" OR gymnastics OR class OR trial OR "
+                  "\"art show\" OR \"picture day\" OR \"early dismissal\" OR "
+                  "\"field trip\" OR \"dress down\" OR \"spirit day\" OR "
+                  "\"school closed\" OR \"half day\" OR \"parent teacher\" OR "
+                  "\"summer camp\" OR \"camp registration\" OR \"camp enrollment\" OR "
+                  "\"camp forms\" OR \"camp orientation\" OR camper OR Campanion))")
+        query2 = "after:" + after
+        result1 = service.users().messages().list(userId="me", q=query1, maxResults=30).execute()
+        result2 = service.users().messages().list(userId="me", q=query2, maxResults=20).execute()
+        seen = set()
+        msgs = []
+        for m in result1.get("messages", []) + result2.get("messages", []):
+            if m["id"] not in seen:
+                seen.add(m["id"])
+                msgs.append(m)
+        for msg in msgs[:30]:
+            full = service.users().messages().get(userId="me", id=msg["id"],
+                   format="metadata", metadataHeaders=["Subject","From"]).execute()
+            headers = full["payload"].get("headers", [])
+            subject = next((h["value"] for h in headers if h["name"]=="Subject"), "")
+            sender  = next((h["value"] for h in headers if h["name"]=="From"), "")
+            all_subjects.append({"email": email, "subject": subject, "from": sender})
+    return {"total": len(all_subjects), "emails": all_subjects}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=cfg.API_PORT, reload=True)
