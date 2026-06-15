@@ -3412,9 +3412,17 @@ def _init_item_feedback():
                 title        TEXT,
                 contact_name TEXT,
                 thumbs       TEXT NOT NULL,
+                source       TEXT DEFAULT 'auto',
+                notes        TEXT,
                 created_at   TEXT DEFAULT (datetime('now'))
             )
         """)
+        for col, defn in [("source", "TEXT DEFAULT 'auto'"), ("notes", "TEXT")]:
+            try:
+                c.execute(f"ALTER TABLE item_feedback ADD COLUMN {col} {defn}")
+                c.commit()
+            except:
+                pass
         c.execute("""
             CREATE TABLE IF NOT EXISTS blocked_senders (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3507,7 +3515,61 @@ def _get_feedback_summary(user_id: str) -> str:
         names = ", ".join(r["contact_name"] for r in blocked)
         lines.append("NEVER surface items from these senders: " + names)
 
+    with _conn() as c:
+        missed = c.execute(
+            "SELECT title, notes FROM item_feedback WHERE user_id=? AND source='user_added' "
+            "ORDER BY created_at DESC LIMIT 10", (user_id,)).fetchall()
+    if missed:
+        lines.append("Items the user manually added because Hearth missed them "
+                      "(these show what this family cares about - look for similar things):")
+        for r in missed:
+            label = r["title"] or ""
+            if r["notes"]:
+                label += " — context: " + r["notes"]
+            lines.append("- " + label)
+
     return "\n".join(lines)
+
+
+
+@app.post("/feedback/missed")
+async def feedback_missed(request: Request):
+    """User manually adds something Hearth missed — creates the item AND records feedback."""
+    from agent.calendar_agent import _conn
+    body      = await request.json()
+    user_id   = body.get("user_id", "")
+    item_type = body.get("item_type", "school_task")  # "bill" | "school_task" | "event"
+    title     = body.get("title", "").strip()
+    due_date  = body.get("due_date")
+    notes     = body.get("notes", "")
+
+    if not title:
+        return {"status": "error", "error": "title required"}
+
+    new_item_id = None
+
+    if item_type == "event":
+        if not due_date:
+            return {"status": "error", "error": "due_date required for event"}
+        new_item_id = _insert_event(user_id, "all", "other", due_date, None, title)
+    else:
+        # bill or school_task -> tasks table
+        with _conn() as c:
+            c.execute(
+                "INSERT INTO tasks(user_id,task_type,title,status,due_date) "
+                "VALUES(?,?,?,?,?)",
+                (user_id, item_type, title, "pending", due_date))
+            c.commit()
+            new_item_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO item_feedback(user_id,item_type,item_id,title,thumbs,source,notes) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (user_id, item_type, new_item_id, title, "up", "user_added", notes))
+        c.commit()
+
+    return {"status": "ok", "item_id": new_item_id}
 
 if __name__ == "__main__":
     import uvicorn
