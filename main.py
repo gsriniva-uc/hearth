@@ -587,6 +587,16 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
 
     keyword_ids = {m["id"] for m in result1.get("messages", [])}
 
+    # Load blocked senders for this user
+    blocked_senders = []
+    try:
+        from agent.calendar_agent import _conn as _bs_conn
+        with _bs_conn() as c:
+            blocked_senders = [r["contact_name"] for r in c.execute(
+                "SELECT contact_name FROM blocked_senders WHERE user_id=?", (user_id,)).fetchall()]
+    except Exception:
+        pass
+
     # Allowlist keywords from user's schools and camps
     extra_keywords = []
     try:
@@ -619,6 +629,11 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
             meta.append({"id": msg["id"], "subject": subject, "from": sender, "date": date_h})
         except Exception:
             continue
+
+    # Drop emails from blocked senders entirely
+    if blocked_senders:
+        meta = [m for m in meta if not any(b.lower() in m["from"].lower() for b in blocked_senders if b)]
+        keyword_ids &= {m["id"] for m in meta}
 
     # Classify remaining (non-keyword) emails: allowlisted sender vs needs triage
     allowlisted_ids   = set()
@@ -704,9 +719,12 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
         e.get("received","") + ") ---\n" + e["body"] + "\n"
         for e in emails_data)
 
+    feedback_summary = _get_feedback_summary(user_id)
+    feedback_block = ("\nUSER FEEDBACK HISTORY (avoid repeating past mistakes):\n" + feedback_summary + "\n") if feedback_summary else ""
+
     import anthropic as ant
     prompt = (
-        "Hearth assistant. Today: " + today_str + " (" + today_iso + "). Children: " + children_str + ".\n"
+        "Hearth assistant. Today: " + today_str + " (" + today_iso + "). Children: " + children_str + "." + feedback_block + "\n"
         "Extract two kinds of items from these emails:\n"
         "1. Dated calendar events (event_type required, must have a specific date)\n"
         "2. Action items with no specific single date — sign-ups, forms to complete, "
