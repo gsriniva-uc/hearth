@@ -60,6 +60,7 @@ def startup():
     _upgrade_camps_table_v2()
     _init_camp_checklist()
     _init_prescriptions()
+    _init_item_feedback()
     # Start background scheduler
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
@@ -2669,11 +2670,17 @@ async def actions_briefing(request: Request):
                    WHERE ct.user_id=? AND ct.status='pending' ORDER BY ct.due_date""",
                 (user_id,)).fetchall()]
 
+    with _conn() as c:
+        blocked_rows = c.execute(
+            "SELECT contact_name FROM blocked_senders WHERE user_id=?", (user_id,)).fetchall()
+    blocked_senders = [r["contact_name"] for r in blocked_rows]
+
     if "bills" in areas:
         with _conn() as c:
-            data["bills"] = [dict(r) for r in c.execute(
+            bills = [dict(r) for r in c.execute(
                 "SELECT * FROM tasks WHERE user_id=? AND task_type='bill' AND status='pending' ORDER BY due_date",
                 (user_id,)).fetchall()]
+            data["bills"] = [b for b in bills if b.get("contact_name") not in blocked_senders]
 
     if "medical" in areas:
         with _conn() as c:
@@ -2683,11 +2690,15 @@ async def actions_briefing(request: Request):
 
     if "school" in areas:
         with _conn() as c:
-            data["school_tasks"] = [dict(r) for r in c.execute(
+            school_tasks = [dict(r) for r in c.execute(
                 "SELECT * FROM tasks WHERE user_id=? AND task_type='school_task' AND status='pending' ORDER BY due_date",
                 (user_id,)).fetchall()]
+            data["school_tasks"] = [t for t in school_tasks if t.get("contact_name") not in blocked_senders]
 
-    prompt = f"""You are Hearth, a family concierge AI. Today is {today}.
+    feedback_summary = _get_feedback_summary(user_id)
+    feedback_block = ("\n\nUSER FEEDBACK HISTORY:\n" + feedback_summary + "\n") if feedback_summary else ""
+
+    prompt = f"""You are Hearth, a family concierge AI. Today is {today}.{feedback_block}
 
 Here is the family's actionable data:
 {json.dumps(data, indent=2, default=str)}
@@ -3366,6 +3377,119 @@ def gmail_scan_debug_v3(user_id: str):
             sender  = next((h["value"] for h in headers if h["name"]=="From"), "")
             all_subjects.append({"email": email, "subject": subject, "from": sender})
     return {"total": len(all_subjects), "emails": all_subjects}
+
+
+
+# ── Feedback loop ──────────────────────────────────────────────────────────────
+
+def _init_item_feedback():
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS item_feedback (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      TEXT NOT NULL,
+                item_type    TEXT NOT NULL,
+                item_id      INTEGER,
+                title        TEXT,
+                contact_name TEXT,
+                thumbs       TEXT NOT NULL,
+                created_at   TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS blocked_senders (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      TEXT NOT NULL,
+                contact_name TEXT NOT NULL,
+                created_at   TEXT DEFAULT (datetime('now')),
+                UNIQUE(user_id, contact_name)
+            )
+        """)
+        c.commit()
+
+
+@app.post("/feedback")
+async def submit_feedback(request: Request):
+    from agent.calendar_agent import _conn
+    body      = await request.json()
+    user_id   = body.get("user_id", "")
+    item_type = body.get("item_type", "")
+    item_id   = body.get("item_id")
+    title     = body.get("title", "")
+    contact   = body.get("contact_name")
+    thumbs    = body.get("thumbs", "")
+
+    if thumbs not in ("up", "down"):
+        return {"status": "error", "error": "thumbs must be up or down"}
+
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO item_feedback(user_id,item_type,item_id,title,contact_name,thumbs) "
+            "VALUES(?,?,?,?,?,?)",
+            (user_id, item_type, item_id, title, contact, thumbs))
+        c.commit()
+
+        # Thumbs down on a bill/school_task with a known sender -> hard block that sender
+        if thumbs == "down" and contact and item_type in ("bill", "school_task"):
+            c.execute(
+                "INSERT OR IGNORE INTO blocked_senders(user_id, contact_name) VALUES(?,?)",
+                (user_id, contact))
+
+        # Thumbs down also dismisses the underlying item so it disappears immediately
+        if thumbs == "down" and item_id:
+            if item_type in ("bill", "medical", "school_task", "camp_task"):
+                c.execute("UPDATE tasks SET status='done' WHERE id=? AND user_id=?",
+                          (item_id, user_id))
+            elif item_type == "camp":
+                c.execute(
+                    "UPDATE camps SET dismissed_action=next_action, next_action=NULL "
+                    "WHERE id=? AND user_id=?", (item_id, user_id))
+        c.commit()
+
+    return {"status": "ok"}
+
+
+def _get_feedback_summary(user_id: str) -> str:
+    """Build a short feedback history block for prompt injection."""
+    from agent.calendar_agent import _conn
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT item_type, title, contact_name, thumbs FROM item_feedback "
+            "WHERE user_id=? ORDER BY created_at DESC LIMIT 20",
+            (user_id,)).fetchall()
+        blocked = c.execute(
+            "SELECT contact_name FROM blocked_senders WHERE user_id=?",
+            (user_id,)).fetchall()
+
+    if not rows and not blocked:
+        return ""
+
+    lines = []
+    downs = [r for r in rows if r["thumbs"] == "down"]
+    ups   = [r for r in rows if r["thumbs"] == "up"]
+
+    if downs:
+        lines.append("Items the user marked NOT useful (avoid surfacing similar items):")
+        for r in downs[:10]:
+            label = r["title"] or ""
+            if r["contact_name"]:
+                label += " (from " + r["contact_name"] + ")"
+            lines.append("- " + label)
+
+    if ups:
+        lines.append("Items the user found useful (prioritize similar items):")
+        for r in ups[:10]:
+            label = r["title"] or ""
+            if r["contact_name"]:
+                label += " (from " + r["contact_name"] + ")"
+            lines.append("- " + label)
+
+    if blocked:
+        names = ", ".join(r["contact_name"] for r in blocked)
+        lines.append("NEVER surface items from these senders: " + names)
+
+    return "\n".join(lines)
 
 if __name__ == "__main__":
     import uvicorn
