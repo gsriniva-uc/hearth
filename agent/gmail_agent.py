@@ -3,6 +3,11 @@ agent/gmail_agent.py — Multi-user version
 
 Token stored per user: data/tokens/{user_id}/google_token.json
 Credentials file shared: data/google_credentials.json
+
+Email collection uses 3 prongs (merged by message ID before extraction):
+  1. Keyword query — fast, catches obvious school/event language
+  2. Sender allowlist — all emails from senders matching school names in child profiles
+  3. Full inbox scan — all emails in the window, catches anything prongs 1+2 miss
 """
 import base64, json, os, re
 from datetime import date, timedelta
@@ -38,26 +43,94 @@ def _extract_body(payload):
     if data and "text" in payload.get("mimeType",""):
         try: return base64.urlsafe_b64decode(data).decode("utf-8",errors="ignore")
         except: return ""
-    for part in payload.get("parts",[]): 
+    for part in payload.get("parts",[]):
         t = _extract_body(part)
         if t: return t
     return ""
 
-def _fetch_emails(user_id: str, days_back=14):
-    service = _get_service(user_id)
-    after   = (date.today()-timedelta(days=days_back)).strftime("%Y/%m/%d")
-    result  = service.users().messages().list(
-        userId="me", q=f"{SCHOOL_QUERY} after:{after}", maxResults=50).execute()
-    emails  = []
-    for msg in result.get("messages",[]):
+def _parse_message(full) -> dict | None:
+    """Return a normalised email dict from a Gmail full-message response, or None if no body."""
+    headers = full["payload"].get("headers", [])
+    subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
+    sender  = next((h["value"] for h in headers if h["name"] == "From"), "")
+    body    = _extract_body(full["payload"])
+    if not body:
+        return None
+    return {"id": full["id"], "subject": subject, "sender": sender, "body": body[:3000]}
+
+def _fetch_batch(service, message_refs: list) -> list:
+    """Fetch full messages for a list of {id} refs; skip failures."""
+    emails = []
+    for msg in message_refs:
         try:
-            full    = service.users().messages().get(userId="me",id=msg["id"],format="full").execute()
-            subject = next((h["value"] for h in full["payload"].get("headers",[])
-                           if h["name"]=="Subject"),"")
-            body    = _extract_body(full["payload"])
-            if body: emails.append({"subject":subject,"body":body[:3000]})
-        except: continue
+            full = service.users().messages().get(userId="me", id=msg["id"], format="full").execute()
+            parsed = _parse_message(full)
+            if parsed:
+                emails.append(parsed)
+        except:
+            continue
     return emails
+
+# ── Prong 1: keyword search ────────────────────────────────────────────────────
+
+def _fetch_by_keyword(service, after: str, max_results=50) -> list:
+    result = service.users().messages().list(
+        userId="me", q=f"{SCHOOL_QUERY} after:{after}", maxResults=max_results
+    ).execute()
+    return _fetch_batch(service, result.get("messages", []))
+
+# ── Prong 2: sender allowlist (school names from child profiles) ───────────────
+
+def _school_names_for_user(user_id: str) -> list[str]:
+    """Return lowercased school names from all child profiles for this user."""
+    try:
+        from agent.profile_agent import get_all_profiles
+        profiles = get_all_profiles(user_id)
+        return [p["school"].lower() for p in profiles if p.get("school")]
+    except:
+        return []
+
+def _fetch_by_sender(service, after: str, school_names: list, max_results=50) -> list:
+    if not school_names:
+        return []
+    # Build a Gmail OR query matching each school name in the From field
+    from_clauses = " OR ".join(f'from:"{name}"' for name in school_names)
+    query = f"({from_clauses}) after:{after}"
+    result = service.users().messages().list(
+        userId="me", q=query, maxResults=max_results
+    ).execute()
+    return _fetch_batch(service, result.get("messages", []))
+
+# ── Prong 3: full inbox scan ───────────────────────────────────────────────────
+
+def _fetch_all_inbox(service, after: str, max_results=100) -> list:
+    result = service.users().messages().list(
+        userId="me", q=f"after:{after}", maxResults=max_results
+    ).execute()
+    return _fetch_batch(service, result.get("messages", []))
+
+# ── Merge + extract ────────────────────────────────────────────────────────────
+
+def _merge_emails(*email_lists) -> list:
+    """Deduplicate by message ID, preserving first-seen order."""
+    seen = set()
+    merged = []
+    for lst in email_lists:
+        for email in lst:
+            if email["id"] not in seen:
+                seen.add(email["id"])
+                merged.append(email)
+    return merged
+
+def _fetch_emails(user_id: str, days_back=14) -> list:
+    service = _get_service(user_id)
+    after   = (date.today() - timedelta(days=days_back)).strftime("%Y/%m/%d")
+
+    prong1 = _fetch_by_keyword(service, after)
+    prong2 = _fetch_by_sender(service, after, _school_names_for_user(user_id))
+    prong3 = _fetch_all_inbox(service, after)
+
+    return _merge_emails(prong1, prong2, prong3)
 
 def _extract_events(emails, children):
     if not emails: return []
@@ -66,10 +139,11 @@ def _extract_events(emails, children):
     digest = "".join(f"\n--- {e['subject']} ---\n{e['body']}\n" for e in emails)
     prompt = f"""Hearth assistant. Today: {today_str}. Children: {children_str}.
 Valid event_type: {", ".join(EVENT_TYPES)}.
-{len(emails)} school emails:
+{len(emails)} emails (school, family, and general inbox):
 {digest}
-Extract upcoming events (today or later). Pay attention to no-school days, closures, early dismissals.
+Extract upcoming events (today or later) relevant to the children listed. Pay attention to no-school days, closures, early dismissals, appointments, and activities.
 Return JSON array: [{{"child_name":"...","event_type":"...","event_date":"YYYY-MM-DD","event_time":"HH:MM|null","notes":"...|null","source_email":"..."}}]
+If an event applies to all children use child_name "all".
 ONLY JSON array."""
     client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
     resp   = client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=2048,
