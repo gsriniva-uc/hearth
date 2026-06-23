@@ -734,7 +734,9 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
         "\"event_date\":\"YYYY-MM-DD\",\"event_time\":null,\"notes\":\"...\"}\n"
         "{\"item_type\":\"school_task\",\"title\":\"short action title\","
         "\"due_date\":\"YYYY-MM-DD or null\",\"org_name\":\"sender organization name\","
-        "\"child_name\":\"name or null\",\"notes\":\"...\"}\n\n"
+        "\"child_name\":\"name or null\",\"notes\":\"...\","
+        "\"source_email\":\"exact subject line of the email this came from\","
+        "\"action_url\":\"https://... if a direct link to take action is in the email, else null\"}\n\n"
         "Use school_fundraiser for: teacher gifts, PTA donations, book fairs, class "
         "contributions, spirit wear, fundraising requests from school.\n"
         "Use bill ONLY for: utility bills, credit cards, insurance invoices, "
@@ -778,11 +780,16 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
                 if existing:
                     skipped += 1
                     continue
+                notes_parts = []
+                if item.get("notes"):      notes_parts.append(item["notes"])
+                if item.get("source_email"): notes_parts.append("From email: " + item["source_email"])
+                notes_val = " | ".join(notes_parts) or None
                 c.execute(
                     "INSERT INTO tasks(user_id,task_type,title,status,due_date,"
-                    "contact_name,child_name) VALUES(?,?,?,?,?,?,?)",
+                    "contact_name,child_name,notes,payment_url) VALUES(?,?,?,?,?,?,?,?,?)",
                     (user_id, "school_task", title, "pending",
-                     item.get("due_date"), item.get("org_name"), item.get("child_name")))
+                     item.get("due_date"), item.get("org_name"), item.get("child_name"),
+                     notes_val, item.get("action_url")))
                 c.commit()
             new += 1
             continue
@@ -1175,42 +1182,38 @@ def gmail_scan(user_id: str):
 
 @app.post("/gmail/scan-all")
 def gmail_scan_all(user_id: str):
+    """Fire-and-forget: starts the scan in a background thread and returns immediately.
+    The scan can take 30-60s; running it synchronously causes Render to time out the request."""
     emails = _list_connected_emails(user_id)
     if not emails:
-        return {"new": 0, "skipped": 0, "accounts_scanned": 0, "error": "No accounts"}
-    total_new = total_skipped = accounts_ok = 0
-    errors = []
-    for email in emails:
-        r = _scan_single_gmail(user_id, email)
-        if r.get("error"):
-            if "expired" in str(r.get("error","")).lower() or "invalid_grant" in str(r.get("error","")).lower() or "not authenticated" in str(r.get("error","")).lower():
-                errors.append({"email": email, "error": "token_expired",
-                    "message": email + " needs to reconnect",
-                    "reauth_url": "https://hearth-4kqf.onrender.com/auth/login?user_id=" + user_id + "&add_account=true"})
-            else:
-                errors.append({"email": email, "error": str(r["error"])})
-        else:
-            total_new     += r.get("new", 0)
-            total_skipped += r.get("skipped", 0)
-            accounts_ok   += 1
-    # Run lifecycle check for pending/registered camps
-    try:
-        from agent.calendar_agent import _conn as _lc_conn
-        with _lc_conn() as c:
-            lc_camps = [dict(r) for r in c.execute(
-                "SELECT * FROM camps WHERE user_id=? AND status IN ('pending','registered')",
-                (user_id,)).fetchall()]
-        for lc_camp in lc_camps:
-            try:
-                _check_camp_lifecycle(user_id, lc_camp)
-            except Exception as e:
-                print("[lifecycle scan] camp " + str(lc_camp.get("id")) + ": " + str(e))
-    except Exception as e:
-        print("[lifecycle scan] " + str(e))
+        return {"status": "error", "error": "No accounts", "errors": []}
 
-    return {"new": total_new, "skipped": total_skipped,
-            "accounts_scanned": accounts_ok,
-            "errors": errors, "error": None}
+    def _run_scan():
+        for email in emails:
+            try:
+                r = _scan_single_gmail(user_id, email)
+                if r.get("error"):
+                    err = str(r["error"])
+                    print(f"[scan-all] {email}: {err}")
+            except Exception as e:
+                print(f"[scan-all] {email}: {e}")
+        # Lifecycle check for pending/registered camps
+        try:
+            from agent.calendar_agent import _conn as _lc_conn
+            with _lc_conn() as c:
+                lc_camps = [dict(r) for r in c.execute(
+                    "SELECT * FROM camps WHERE user_id=? AND status IN ('pending','registered')",
+                    (user_id,)).fetchall()]
+            for lc_camp in lc_camps:
+                try:
+                    _check_camp_lifecycle(user_id, lc_camp)
+                except Exception as e:
+                    print("[lifecycle scan] camp " + str(lc_camp.get("id")) + ": " + str(e))
+        except Exception as e:
+            print("[lifecycle scan] " + str(e))
+
+    threading.Thread(target=_run_scan, daemon=True).start()
+    return {"status": "scanning", "errors": [], "error": None}
 
 
 @app.get("/connected-gmails")
@@ -2726,8 +2729,10 @@ Rules:
 - ONLY include items where the parent needs to DO something
 - Do NOT include calendar events or informational items
 - For school_tasks, create an item using the task title as the title, with org name (contact_name)
-  and due_date (if any) in the subtitle. Use action_label "View details" with action_url null,
-  unless the task clearly implies a link/registration. item_type "school_task", item_id = task id.
+  and due_date (if any) in the subtitle. If payment_url is set, use it as action_url with an
+  appropriate action_label ("Submit", "Register", "Pay Now", etc.). Otherwise set action_url null
+  and action_label "View details". item_type "school_task", item_id = task id.
+  Include notes in subtitle if it helps the user trace back to the source email.
 - For registered_camps_with_next_steps, create an item using the next_action text as the title.
   If app_name is set, set action_label to "Open {{app_name}}", app_name, and deep_link_url accordingly.
   Otherwise set action_label appropriately (e.g. "View details") with action_url null.
