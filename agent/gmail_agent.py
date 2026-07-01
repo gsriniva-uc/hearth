@@ -59,11 +59,15 @@ ACTIVITY_QUERY = (
     "tournament OR tryout OR appointment OR dismissal OR \"field trip\" OR "
     "newsletter OR \"no school\" OR \"early release\" OR \"school holiday\" OR "
     "reminder OR RSVP OR invoice OR payment OR festival OR birthday OR show OR "
-    "concert OR gymnastics OR \"art show\" OR \"picture day\" OR \"spirit day\" OR "
+    "concert OR gymnastics OR skating OR swim OR swimming OR dance OR ballet OR "
+    "soccer OR baseball OR softball OR tennis OR karate OR martial OR chess OR "
+    "coding OR robotics OR art OR music OR club OR league OR team OR "
+    "\"art show\" OR \"picture day\" OR \"spirit day\" OR "
     "\"school closed\" OR \"half day\" OR \"parent teacher\" OR "
     "\"summer camp\" OR \"camp registration\" OR \"camp enrollment\" OR "
     "\"camp forms\" OR \"camp orientation\" OR camper OR Campanion OR "
-    "\"action required\" OR \"final reminder\" OR enrollment OR form OR forms)"
+    "\"action required\" OR \"final reminder\" OR enrollment OR form OR forms OR "
+    "welcome OR orientation OR waiver OR permission OR activity OR activities)"
 )
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -130,7 +134,7 @@ def _blocked_senders(user_id: str) -> list[str]:
 
 # ── Main scan function ─────────────────────────────────────────────────────────
 
-def scan_gmail_account(user_id: str, email: str, days_back: int = 30) -> dict:
+def scan_gmail_account(user_id: str, email: str, days_back: int = 90) -> dict:
     """
     Full Gmail scan for one connected account. Returns {new, skipped, emails_scanned, error}.
 
@@ -154,11 +158,11 @@ def scan_gmail_account(user_id: str, email: str, days_back: int = 30) -> dict:
 
     # Pass 1 — keyword subject match
     res1 = service.users().messages().list(
-        userId="me", q=ACTIVITY_QUERY + " after:" + after, maxResults=75
+        userId="me", q=ACTIVITY_QUERY + " after:" + after, maxResults=150
     ).execute()
     # Pass 2 — full inbox
     res2 = service.users().messages().list(
-        userId="me", q="after:" + after, maxResults=100
+        userId="me", q="after:" + after, maxResults=200
     ).execute()
 
     seen_ids  = set()
@@ -177,7 +181,7 @@ def scan_gmail_account(user_id: str, email: str, days_back: int = 30) -> dict:
 
     # Fetch lightweight metadata for all candidates
     meta = []
-    for msg in all_msgs[:100]:
+    for msg in all_msgs[:200]:
         try:
             full = service.users().messages().get(
                 userId="me", id=msg["id"], format="metadata",
@@ -207,37 +211,41 @@ def scan_gmail_account(user_id: str, email: str, days_back: int = 30) -> dict:
         else:
             triage_candidates.append(m)
 
-    # Claude triage — cheap subject-only pass to filter irrelevant emails
+    # Claude triage — cheap subject-only pass, processed in batches so nothing is dropped
     triage_ids = set()
-    if triage_candidates:
+    TRIAGE_BATCH = 80
+    for batch_start in range(0, len(triage_candidates), TRIAGE_BATCH):
+        batch = triage_candidates[batch_start:batch_start + TRIAGE_BATCH]
         lines = [f"{i}. Subject: {m['subject']} | From: {m['from']}"
-                 for i, m in enumerate(triage_candidates[:30])]
+                 for i, m in enumerate(batch)]
         triage_prompt = (
             "Below are email subjects and senders. Return the indices of emails that "
-            "MIGHT be relevant to a family's logistics. Be generous — include anything about:\n"
+            "MIGHT be relevant to a family's logistics. Be generous — when in doubt, include it.\n"
+            "Include anything about:\n"
             "- School events, forms, sign-ups, orientation, field trips, no-school days\n"
             "- Summer camps, day camps, sports camps, camp registration or confirmation\n"
             "- Kids classes or lessons (skating, swimming, dance, gymnastics, coding, art, music, etc.)\n"
+            "- Club activities, sports leagues, teams\n"
             "- Sports practices, games, tournaments, tryouts\n"
             "- Doctor, dentist, or therapy appointments\n"
-            "- Registration or enrollment confirmations for any kids activity\n"
-            "- Payment receipts for kids activities\n"
+            "- Registration, enrollment, or payment confirmations for any kids activity\n"
+            "- Welcome emails or orientation from any kids program\n"
             "- Bills or payments for the family\n"
-            "Ignore: investment/finance updates, marketing, ads, general news, job alerts, "
-            "subscriptions unrelated to kids.\n\n"
+            "Exclude only: investment/brokerage updates, marketing from stores, general news, "
+            "job alerts, social media notifications.\n\n"
             + "\n".join(lines) +
             "\n\nReturn ONLY a JSON array of indices, e.g. [0,3,7]. If none, return []."
         )
         try:
             client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
-            resp   = client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=200,
+            resp   = client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=400,
                      messages=[{"role": "user", "content": triage_prompt}])
             raw  = re.sub(r"^```json\s*", "", resp.content[0].text.strip())
             raw  = re.sub(r"\s*```$", "", raw)
             idxs = json.loads(raw)
             for i in idxs:
-                if isinstance(i, int) and 0 <= i < len(triage_candidates):
-                    triage_ids.add(triage_candidates[i]["id"])
+                if isinstance(i, int) and 0 <= i < len(batch):
+                    triage_ids.add(batch[i]["id"])
         except Exception as e:
             print(f"[gmail triage] {e}")
 
