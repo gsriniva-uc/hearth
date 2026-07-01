@@ -163,3 +163,65 @@ def sign_out(user_id: str):
 def is_credentials_configured() -> bool:
     """Check if the Google OAuth credentials file exists."""
     return os.path.exists(cfg.GOOGLE_CREDS)
+
+
+# ── Per-email token helpers (for mobile OAuth flow) ───────────────────────────
+
+def _token_dir(user_id: str) -> str:
+    d = os.path.join(cfg.DATA_DIR, "tokens", user_id)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _safe_email(email: str) -> str:
+    return email.replace(".", "_").replace("@", "_at_")
+
+def save_email_token(user_id: str, email: str, token_data: dict):
+    safe = _safe_email(email)
+    path = os.path.join(_token_dir(user_id), "gmail_" + safe + ".json")
+    with open(path, "w") as f:
+        json.dump(token_data, f)
+
+def load_email_token(user_id: str, email: str) -> dict | None:
+    safe = _safe_email(email)
+    path = os.path.join(_token_dir(user_id), "gmail_" + safe + ".json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+def list_connected_emails(user_id: str) -> list[str]:
+    d = _token_dir(user_id)
+    emails = []
+    for fname in os.listdir(d):
+        if fname.startswith("gmail_") and fname.endswith(".json"):
+            safe  = fname[6:-5]
+            email = safe.replace("_at_", "@", 1)
+            parts = email.split("@")
+            email = "@".join(p.replace("_", ".") for p in parts)
+            emails.append(email)
+    return emails
+
+def get_fresh_credentials(user_id: str, email: str):
+    """Return a valid Credentials object for a per-email token, refreshing if needed."""
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    token_data = load_email_token(user_id, email)
+    if not token_data:
+        return None
+    creds = Credentials(
+        token=token_data.get("access_token"),
+        refresh_token=token_data.get("refresh_token"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=cfg.GOOGLE_CLIENT_ID,
+        client_secret=cfg.GOOGLE_CLIENT_SECRET,
+        scopes=cfg.GOOGLE_SCOPES,
+    )
+    if not creds.valid and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            token_data["access_token"] = creds.token
+            save_email_token(user_id, email, token_data)
+        except Exception as e:
+            print(f"[auth] token refresh failed for {email}: {e}")
+            return None
+    return creds if creds.valid else None

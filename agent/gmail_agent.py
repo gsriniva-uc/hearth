@@ -1,21 +1,30 @@
 """
-agent/gmail_agent.py — Multi-user version
+agent/gmail_agent.py — Single source of truth for all Gmail scanning.
 
-Token stored per user: data/tokens/{user_id}/google_token.json
-Credentials file shared: data/google_credentials.json
+All email scanning logic lives here. main.py imports scan_gmail_account
+and auto_scan_and_save — nothing email-related is defined in main.py.
 
-Email collection uses 3 prongs (merged by message ID before extraction):
-  1. Keyword query — fast, catches obvious school/event language
-  2. Sender allowlist — all emails from senders matching school names in child profiles
-  3. Full inbox scan — all emails in the window, catches anything prongs 1+2 miss
+scan_gmail_account(user_id, email)
+    Full 3-pass scan for one connected Gmail account:
+      Pass 1 — keyword match on subject (fast, high-precision)
+      Pass 2 — full inbox (catch-all)
+      Merged → blocked sender filter → allowlist → Claude triage
+      → full body fetch → Claude extraction → save to DB + GCal
+
+auto_scan_and_save(user_id, children, days_back)
+    Wrapper: scans all connected Gmail accounts for a user.
 """
 import base64, json, os, re
 from datetime import date, timedelta
 import anthropic
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 import hearth_config as cfg
-from agent.auth import get_credentials, token_path
+from agent.auth import (
+    get_credentials, list_connected_emails,
+    get_fresh_credentials, load_email_token,
+)
+
+# ── Event types ────────────────────────────────────────────────────────────────
 
 EVENT_TYPES = [
     # School
@@ -29,179 +38,370 @@ EVENT_TYPES = [
     # Registrations & payments
     "registration_confirmed", "payment_confirmed", "registration_deadline",
     # Misc
-    "movie_night", "special_day", "other",
+    "movie_night", "special_day", "activity", "school_fundraiser", "other",
 ]
 
-def is_credentials_configured(): return os.path.exists(cfg.GOOGLE_CREDS)
-def is_authenticated(user_id: str) -> bool: return get_credentials(user_id) is not None
+# ── Known family platform domains (auto-allowlisted) ──────────────────────────
 
-def _get_service(user_id: str):
-    creds = get_credentials(user_id)
-    if not creds: raise Exception("Not authenticated — please sign in first")
-    return build("gmail","v1",credentials=creds)
+KNOWN_FAMILY_DOMAINS = [
+    "seesaw.me", "classdojo.com", "remind.com", "parentsquare.com",
+    "campintouch.com", "campanion.com", "campdoc.com", "ultracamp.com",
+    "campminder.com", "mybrightwheel.com", "schoolmessenger.com",
+    "finalforms.com", "campbrain.com", "myschoolapp.com", "blackbaud.com",
+    "powerschool.com", "transact.com", "campnetwork.com",
+]
 
-def _extract_body(payload):
-    data = payload.get("body",{}).get("data","")
-    if data and "text" in payload.get("mimeType",""):
-        try: return base64.urlsafe_b64decode(data).decode("utf-8",errors="ignore")
-        except: return ""
-    for part in payload.get("parts",[]):
-        t = _extract_body(part)
-        if t: return t
-    return ""
-
-def _parse_message(full) -> dict | None:
-    """Return a normalised email dict from a Gmail full-message response, or None if no body."""
-    headers = full["payload"].get("headers", [])
-    subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
-    sender  = next((h["value"] for h in headers if h["name"] == "From"), "")
-    body    = _extract_body(full["payload"])
-    if not body:
-        return None
-    return {"id": full["id"], "subject": subject, "sender": sender, "body": body[:3000]}
-
-def _fetch_batch(service, message_refs: list) -> list:
-    """Fetch full messages for a list of {id} refs; skip failures."""
-    emails = []
-    for msg in message_refs:
-        try:
-            full = service.users().messages().get(userId="me", id=msg["id"], format="full").execute()
-            parsed = _parse_message(full)
-            if parsed:
-                emails.append(parsed)
-        except:
-            continue
-    return emails
-
-# ── Prong 1: keyword search (broad — any child activity language) ──────────────
+# ── Keyword query (subject-level, fast pass) ───────────────────────────────────
 
 ACTIVITY_QUERY = (
     "subject:(camp OR class OR practice OR registration OR confirmed OR "
     "\"sign up\" OR enrolled OR schedule OR recital OR performance OR "
     "tournament OR tryout OR appointment OR dismissal OR \"field trip\" OR "
-    "newsletter OR \"no school\" OR \"early release\" OR \"school holiday\")"
+    "newsletter OR \"no school\" OR \"early release\" OR \"school holiday\" OR "
+    "reminder OR RSVP OR invoice OR payment OR festival OR birthday OR show OR "
+    "concert OR gymnastics OR \"art show\" OR \"picture day\" OR \"spirit day\" OR "
+    "\"school closed\" OR \"half day\" OR \"parent teacher\" OR "
+    "\"summer camp\" OR \"camp registration\" OR \"camp enrollment\" OR "
+    "\"camp forms\" OR \"camp orientation\" OR camper OR Campanion OR "
+    "\"action required\" OR \"final reminder\" OR enrollment OR form OR forms)"
 )
 
-def _fetch_by_keyword(service, after: str, max_results=75) -> list:
-    result = service.users().messages().list(
-        userId="me", q=f"{ACTIVITY_QUERY} after:{after}", maxResults=max_results
-    ).execute()
-    return _fetch_batch(service, result.get("messages", []))
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
-# ── Prong 2: sender allowlist (school names from child profiles) ───────────────
+def is_credentials_configured() -> bool:
+    return os.path.exists(cfg.GOOGLE_CREDS)
 
-def _school_names_for_user(user_id: str) -> list[str]:
-    """Return lowercased school names from all child profiles for this user."""
+def is_authenticated(user_id: str) -> bool:
+    return get_credentials(user_id) is not None
+
+def _extract_body(payload) -> str:
+    data = payload.get("body", {}).get("data", "")
+    if data and "text" in payload.get("mimeType", ""):
+        try:
+            return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+        except:
+            return ""
+    for part in payload.get("parts", []):
+        t = _extract_body(part)
+        if t:
+            return t
+    return ""
+
+def _is_family_platform_sender(from_addr: str, extra_keywords: list) -> bool:
+    f = from_addr.lower()
+    for d in KNOWN_FAMILY_DOMAINS:
+        if d in f:
+            return True
+    for kw in extra_keywords:
+        if kw and len(kw) > 3 and kw.lower() in f:
+            return True
+    return False
+
+def _extra_allowlist_keywords(user_id: str) -> list[str]:
+    """School and camp names from this user's profiles — used for sender allowlisting."""
+    keywords = []
     try:
         from agent.profile_agent import get_all_profiles
-        profiles = get_all_profiles(user_id)
-        return [p["school"].lower() for p in profiles if p.get("school")]
+        for p in get_all_profiles(user_id):
+            if p.get("school"):
+                keywords += re.findall(r"[A-Za-z]{4,}", p["school"])
+    except:
+        pass
+    try:
+        from agent.calendar_agent import _conn
+        with _conn() as c:
+            for r in c.execute(
+                "SELECT DISTINCT camp_name FROM camps WHERE user_id=?",
+                (user_id,)).fetchall():
+                keywords += re.findall(r"[A-Za-z]{4,}", r["camp_name"])
+    except:
+        pass
+    return keywords
+
+def _blocked_senders(user_id: str) -> list[str]:
+    try:
+        from agent.calendar_agent import _conn
+        with _conn() as c:
+            return [r["contact_name"] for r in c.execute(
+                "SELECT contact_name FROM blocked_senders WHERE user_id=?",
+                (user_id,)).fetchall()]
     except:
         return []
 
-def _fetch_by_sender(service, after: str, school_names: list, max_results=50) -> list:
-    if not school_names:
-        return []
-    # Build a Gmail OR query matching each school name in the From field
-    from_clauses = " OR ".join(f'from:"{name}"' for name in school_names)
-    query = f"({from_clauses}) after:{after}"
-    result = service.users().messages().list(
-        userId="me", q=query, maxResults=max_results
-    ).execute()
-    return _fetch_batch(service, result.get("messages", []))
+# ── Main scan function ─────────────────────────────────────────────────────────
 
-# ── Prong 3: full inbox scan ───────────────────────────────────────────────────
+def scan_gmail_account(user_id: str, email: str, days_back: int = 30) -> dict:
+    """
+    Full Gmail scan for one connected account. Returns {new, skipped, emails_scanned, error}.
 
-def _fetch_all_inbox(service, after: str, max_results=200) -> list:
-    result = service.users().messages().list(
-        userId="me", q=f"after:{after}", maxResults=max_results
-    ).execute()
-    return _fetch_batch(service, result.get("messages", []))
+    Pass 1: keyword subject match (fast, catches obvious phrasing)
+    Pass 2: full inbox (catch-all for anything Pass 1 misses)
+    Then: block filter → allowlist → Claude triage → body fetch → Claude extraction → save
+    """
+    from agent.calendar_agent import (
+        _conn, _event_exists, _insert_event,
+        _get_gcal_service, _gcal_event_exists, _write_to_gcal,
+        _get_feedback_summary,
+    )
+    from agent.profile_agent import get_children
 
-# ── Merge + extract ────────────────────────────────────────────────────────────
+    creds = get_fresh_credentials(user_id, email)
+    if not creds:
+        return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": "Not authenticated"}
 
-def _merge_emails(*email_lists) -> list:
-    """Deduplicate by message ID, preserving first-seen order."""
-    seen = set()
-    merged = []
-    for lst in email_lists:
-        for email in lst:
-            if email["id"] not in seen:
-                seen.add(email["id"])
-                merged.append(email)
-    return merged
-
-def _fetch_emails(user_id: str, days_back=30) -> list:
-    service = _get_service(user_id)
+    service = build("gmail", "v1", credentials=creds)
     after   = (date.today() - timedelta(days=days_back)).strftime("%Y/%m/%d")
 
-    prong1 = _fetch_by_keyword(service, after)
-    prong2 = _fetch_by_sender(service, after, _school_names_for_user(user_id))
-    prong3 = _fetch_all_inbox(service, after)
+    # Pass 1 — keyword subject match
+    res1 = service.users().messages().list(
+        userId="me", q=ACTIVITY_QUERY + " after:" + after, maxResults=75
+    ).execute()
+    # Pass 2 — full inbox
+    res2 = service.users().messages().list(
+        userId="me", q="after:" + after, maxResults=100
+    ).execute()
 
-    return _merge_emails(prong1, prong2, prong3)
+    seen_ids  = set()
+    all_msgs  = []
+    for msg in res1.get("messages", []) + res2.get("messages", []):
+        if msg["id"] not in seen_ids:
+            seen_ids.add(msg["id"])
+            all_msgs.append(msg)
 
-def _extract_events(emails, children):
-    if not emails: return []
-    today_str    = date.today().strftime("%A, %B %d, %Y")
-    children_str = ", ".join(children) or "the children"
-    digest = "".join(f"\n--- FROM: {e['sender']} | SUBJECT: {e['subject']} ---\n{e['body']}\n" for e in emails)
-    prompt = f"""You are Hearth, a family calendar assistant. Today: {today_str}. Children: {children_str}.
+    if not all_msgs:
+        return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
 
-Your job is to extract ANYTHING from these emails that belongs on a family calendar or represents a commitment made for the children. Think broadly — not just school events but ALL kids activities.
+    keyword_ids   = {m["id"] for m in res1.get("messages", [])}
+    blocked       = _blocked_senders(user_id)
+    extra_kws     = _extra_allowlist_keywords(user_id)
 
-Extract:
-- School events (no school days, early dismissals, field trips, picture day, etc.)
-- Classes and lessons (skating, swimming, dance, coding, art, music, etc.)
-- Camps (summer camps, day camps, sports camps — including confirmation/registration emails)
-- Sports (practices, games, tournaments, tryouts)
-- Appointments (doctor, dentist, therapy)
-- Performances and recitals
-- Registration confirmations and payment receipts — these mean the child IS enrolled, extract the activity start date or session dates
-- Deadlines (registration deadlines, form submission deadlines)
+    # Fetch lightweight metadata for all candidates
+    meta = []
+    for msg in all_msgs[:100]:
+        try:
+            full = service.users().messages().get(
+                userId="me", id=msg["id"], format="metadata",
+                metadataHeaders=["Subject", "From", "Date"]
+            ).execute()
+            headers = full["payload"].get("headers", [])
+            subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
+            sender  = next((h["value"] for h in headers if h["name"] == "From"), "")
+            date_h  = next((h["value"] for h in headers if h["name"] == "Date"), "")
+            meta.append({"id": msg["id"], "subject": subject, "from": sender, "date": date_h})
+        except:
+            continue
 
-Valid event_type values: {", ".join(EVENT_TYPES)}
+    # Drop blocked senders
+    if blocked:
+        meta = [m for m in meta if not any(b.lower() in m["from"].lower() for b in blocked if b)]
+        keyword_ids &= {m["id"] for m in meta}
 
-Use registration_confirmed when an email confirms a child is registered/enrolled/paid for something.
-Use payment_confirmed when a payment receipt is found — extract what it was for and when the activity starts.
+    # Classify non-keyword emails: allowlisted vs needs Claude triage
+    allowlisted_ids   = set()
+    triage_candidates = []
+    for m in meta:
+        if m["id"] in keyword_ids:
+            continue
+        if _is_family_platform_sender(m["from"], extra_kws):
+            allowlisted_ids.add(m["id"])
+        else:
+            triage_candidates.append(m)
 
-{len(emails)} emails:
-{digest}
+    # Claude triage — cheap subject-only pass to filter irrelevant emails
+    triage_ids = set()
+    if triage_candidates:
+        lines = [f"{i}. Subject: {m['subject']} | From: {m['from']}"
+                 for i, m in enumerate(triage_candidates[:30])]
+        triage_prompt = (
+            "Below are email subjects and senders. Return the indices of emails that "
+            "MIGHT be relevant to a family's logistics. Be generous — include anything about:\n"
+            "- School events, forms, sign-ups, orientation, field trips, no-school days\n"
+            "- Summer camps, day camps, sports camps, camp registration or confirmation\n"
+            "- Kids classes or lessons (skating, swimming, dance, gymnastics, coding, art, music, etc.)\n"
+            "- Sports practices, games, tournaments, tryouts\n"
+            "- Doctor, dentist, or therapy appointments\n"
+            "- Registration or enrollment confirmations for any kids activity\n"
+            "- Payment receipts for kids activities\n"
+            "- Bills or payments for the family\n"
+            "Ignore: investment/finance updates, marketing, ads, general news, job alerts, "
+            "subscriptions unrelated to kids.\n\n"
+            + "\n".join(lines) +
+            "\n\nReturn ONLY a JSON array of indices, e.g. [0,3,7]. If none, return []."
+        )
+        try:
+            client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
+            resp   = client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=200,
+                     messages=[{"role": "user", "content": triage_prompt}])
+            raw  = re.sub(r"^```json\s*", "", resp.content[0].text.strip())
+            raw  = re.sub(r"\s*```$", "", raw)
+            idxs = json.loads(raw)
+            for i in idxs:
+                if isinstance(i, int) and 0 <= i < len(triage_candidates):
+                    triage_ids.add(triage_candidates[i]["id"])
+        except Exception as e:
+            print(f"[gmail triage] {e}")
 
-Return a JSON array of all events found. For each event:
-- child_name: name of the child it applies to, or "all" if all children
-- event_type: one of the valid types above
-- event_date: YYYY-MM-DD (use activity start date for registrations; skip if truly no date found)
-- event_time: HH:MM or null
-- notes: brief description including activity name, location, or amount paid if relevant
-- source_email: the email subject
+    final_ids = keyword_ids | allowlisted_ids | triage_ids
 
-Only include events with a date. ONLY return a JSON array, no other text."""
+    # Fetch full bodies for final set
+    meta_by_id  = {m["id"]: m for m in meta}
+    emails_data = []
+    for mid in final_ids:
+        m = meta_by_id.get(mid)
+        if not m:
+            continue
+        try:
+            full = service.users().messages().get(userId="me", id=mid, format="full").execute()
+            body = _extract_body(full["payload"])
+            if body:
+                emails_data.append({
+                    "subject":  m["subject"],
+                    "from":     m["from"],
+                    "body":     body[:3000],
+                    "received": m["date"],
+                })
+        except:
+            continue
+
+    if not emails_data:
+        return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
+
+    print(f"[gmail] {len(emails_data)} emails → Claude | "
+          f"keyword={len(keyword_ids)} allowlisted={len(allowlisted_ids)} triage={len(triage_ids)}")
+
+    # Build extraction prompt
+    children_str    = ", ".join(get_children(user_id)) or "the children"
+    today_str       = date.today().strftime("%A, %B %d, %Y")
+    today_iso       = date.today().isoformat()
+    feedback_block  = ""
+    try:
+        fb = _get_feedback_summary(user_id)
+        if fb:
+            feedback_block = "\nUSER FEEDBACK HISTORY (avoid repeating past mistakes):\n" + fb + "\n"
+    except:
+        pass
+
+    digest = "".join(
+        f"--- {e['subject']} (from: {e['from']}, received: {e['received']}) ---\n{e['body']}\n"
+        for e in emails_data
+    )
+
+    prompt = (
+        f"Hearth assistant. Today: {today_str} ({today_iso}). Children: {children_str}.{feedback_block}\n"
+        "Extract two kinds of items from these emails:\n"
+        "1. Dated calendar events (must have a specific date)\n"
+        "2. Action items — sign-ups, forms to complete, registration tasks (school_task)\n\n"
+        "Return a JSON array. Each item is one of:\n"
+        "{\"item_type\":\"event\",\"child_name\":\"...\",\"event_type\":\"...\","
+        "\"event_date\":\"YYYY-MM-DD\",\"event_time\":null,\"notes\":\"...\"}\n"
+        "{\"item_type\":\"school_task\",\"title\":\"short action title\","
+        "\"due_date\":\"YYYY-MM-DD or null\",\"org_name\":\"sender org name\","
+        "\"child_name\":\"name or null\",\"notes\":\"...\","
+        "\"source_email\":\"exact subject line\","
+        "\"action_url\":\"https://... or null\"}\n\n"
+        f"Valid event_type: {','.join(EVENT_TYPES)}\n"
+        "Use camp for summer/day/sports camps.\n"
+        "Use class for recurring lessons (skating, swimming, dance, coding, art, music, etc.).\n"
+        "Use registration_confirmed when an email confirms enrollment/registration/payment "
+        "— use the activity start date as event_date.\n"
+        "Use school_fundraiser for: teacher gifts, PTA donations, book fairs, spirit wear.\n"
+        "Do NOT use bill as an event_type.\n"
+        "Only create school_task for genuinely actionable items from schools, camps, or "
+        "family platforms — not marketing or financial statements unrelated to kids.\n"
+        "Always use the sender's actual organization name in org_name.\n"
+        f"Emails:\n{digest[:30000]}\nONLY JSON array."
+    )
+
     client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
-    resp   = client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=2048,
-        messages=[{"role":"user","content":prompt}])
-    raw = re.sub(r"^```json\s*","",resp.content[0].text.strip())
-    raw = re.sub(r"\s*```$","",raw)
+    resp   = client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=4096,
+             messages=[{"role": "user", "content": prompt}])
+    raw    = re.sub(r"^```json\s*", "", resp.content[0].text.strip())
+    raw    = re.sub(r"\s*```$", "", raw)
     try:
-        evs = json.loads(raw); return evs if isinstance(evs,list) else []
-    except: return []
+        items = json.loads(raw)
+    except:
+        print(f"[gmail extract] JSON parse failed: {raw[:500]}")
+        items = []
 
-def auto_scan_and_save(user_id: str, children: list, days_back=30) -> dict:
-    """Scan Gmail for this user and save new events (deduped) to their event store."""
-    from agent.calendar_agent import _insert_event, _event_exists, _sync_to_gcal, _sync_to_outlook
+    print(f"[gmail extract] {len(emails_data)} emails → {len(items)} items")
+
+    # Save extracted items
+    new = skipped = 0
+    gcal_service = None
     try:
-        emails = _fetch_emails(user_id, days_back)
-        if not emails: return {"new":0,"skipped":0,"emails_scanned":0,"error":None}
-        events = _extract_events(emails, children)
-        new = skipped = 0
-        for ev in events:
-            child, etype, edate = ev.get("child_name","all"), ev.get("event_type","other"), ev.get("event_date","")
-            if not edate: continue
-            if _event_exists(user_id, child, etype, edate):
-                skipped += 1; continue
-            eid = _insert_event(user_id, child, etype, edate, ev.get("event_time"), ev.get("notes"))
-            _sync_to_gcal(user_id, eid, child, etype, edate, ev.get("event_time"), ev.get("notes"))
+        gcal_service = _get_gcal_service(user_id, email)
+    except:
+        pass
+
+    for item in items:
+        item_type = item.get("item_type", "event")
+
+        if item_type == "school_task":
+            title = (item.get("title") or "").strip()
+            if not title:
+                continue
+            with _conn() as c:
+                existing = c.execute(
+                    "SELECT id FROM tasks WHERE user_id=? AND task_type='school_task' AND title=?",
+                    (user_id, title)).fetchone()
+                if existing:
+                    skipped += 1
+                    continue
+                notes_parts = []
+                if item.get("notes"):        notes_parts.append(item["notes"])
+                if item.get("source_email"): notes_parts.append("From email: " + item["source_email"])
+                c.execute(
+                    "INSERT INTO tasks(user_id,task_type,title,status,due_date,"
+                    "contact_name,child_name,notes,payment_url) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (user_id, "school_task", title, "pending",
+                     item.get("due_date"), item.get("org_name"), item.get("child_name"),
+                     " | ".join(notes_parts) or None, item.get("action_url")))
+                c.commit()
             new += 1
-        return {"new":new,"skipped":skipped,"emails_scanned":len(emails),"error":None}
-    except Exception as e:
-        return {"new":0,"skipped":0,"emails_scanned":0,"error":str(e)}
+            continue
+
+        child = item.get("child_name") or "all"
+        etype = item.get("event_type") or "other"
+        edate = item.get("event_date", "")
+        if not edate:
+            continue
+        if _event_exists(user_id, child, etype, edate):
+            skipped += 1
+            continue
+        event_id = _insert_event(user_id, child, etype, edate, item.get("event_time"), item.get("notes"))
+        # Sync to GCal
+        try:
+            if gcal_service:
+                gcal_summary = item.get("notes") or etype.replace("_", " ").title()
+                if child and child != "all":
+                    gcal_summary = child + " - " + gcal_summary
+                if not _gcal_event_exists(gcal_service, gcal_summary, edate):
+                    gcal_id = _write_to_gcal(user_id, email, gcal_summary, edate,
+                                             item.get("event_time"), item.get("notes"))
+                    if gcal_id and gcal_id != "duplicate":
+                        with _conn() as c:
+                            c.execute("UPDATE events SET gcal_event_id=? WHERE id=?",
+                                      (gcal_id, event_id))
+                            c.commit()
+        except Exception as e:
+            print(f"[gcal scan write] {e}")
+        new += 1
+
+    return {"new": new, "skipped": skipped, "emails_scanned": len(emails_data), "error": None}
+
+
+def auto_scan_and_save(user_id: str, children: list = None, days_back: int = 30) -> dict:
+    """Scan all connected Gmail accounts for this user and save new events/tasks."""
+    emails = list_connected_emails(user_id)
+    if not emails:
+        return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": "No connected Gmail accounts"}
+
+    total = {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
+    for email in emails:
+        result = scan_gmail_account(user_id, email, days_back=days_back)
+        total["new"]            += result.get("new", 0)
+        total["skipped"]        += result.get("skipped", 0)
+        total["emails_scanned"] += result.get("emails_scanned", 0)
+        if result.get("error"):
+            total["error"] = result["error"]
+    return total

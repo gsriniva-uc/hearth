@@ -9,6 +9,7 @@ from datetime import date, timedelta, datetime
 import anthropic
 import hearth_config as cfg
 from agent.state import HearthState
+from googleapiclient.discovery import build
 
 EVENT_TYPES = [
     "dress_down_day","early_dismissal","recital","movie_night","field_trip",
@@ -172,6 +173,106 @@ def _sync_to_outlook(user_id, event_id, child_name, event_type,
                 c.commit()
     except Exception as e:
         print(f"[outlook] {e}")
+
+# ── GCal helpers (per-email token) ────────────────────────────────────────────
+
+def _get_gcal_service(user_id: str, email: str):
+    from agent.auth import get_fresh_credentials
+    creds = get_fresh_credentials(user_id, email)
+    if not creds:
+        return None
+    return build("calendar", "v3", credentials=creds)
+
+def _gcal_event_exists(service, summary: str, event_date: str) -> bool:
+    try:
+        result = service.events().list(
+            calendarId="primary",
+            timeMin=event_date + "T00:00:00Z",
+            timeMax=event_date + "T23:59:59Z",
+            q=summary[:30], singleEvents=True,
+        ).execute()
+        for ev in result.get("items", []):
+            if summary.lower()[:20] in ev.get("summary", "").lower():
+                return True
+    except:
+        pass
+    return False
+
+def _write_to_gcal(user_id: str, email: str, summary: str,
+                   event_date: str, event_time: str = None,
+                   description: str = None) -> str | None:
+    from datetime import datetime, timedelta as td
+    service = _get_gcal_service(user_id, email)
+    if not service:
+        return None
+    if _gcal_event_exists(service, summary, event_date):
+        return "duplicate"
+    if event_time:
+        start_dt = event_date + "T" + event_time + ":00"
+        try:
+            end = (datetime.fromisoformat(start_dt) + td(hours=1)).strftime("%Y-%m-%dT%H:%M:00")
+        except:
+            end = start_dt
+        start = {"dateTime": start_dt, "timeZone": "America/New_York"}
+        end_t = {"dateTime": end,      "timeZone": "America/New_York"}
+    else:
+        start = {"date": event_date}
+        end_t = {"date": event_date}
+    body = {"summary": summary, "start": start, "end": end_t}
+    if description:
+        body["description"] = description
+    try:
+        result = service.events().insert(calendarId="primary", body=body).execute()
+        return result.get("id")
+    except Exception as e:
+        print(f"[gcal write] {e}")
+        return None
+
+# ── Feedback summary (for prompt injection) ────────────────────────────────────
+
+def _get_feedback_summary(user_id: str) -> str:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT item_type, title, contact_name, thumbs FROM item_feedback "
+            "WHERE user_id=? ORDER BY created_at DESC LIMIT 20",
+            (user_id,)).fetchall()
+        blocked = c.execute(
+            "SELECT contact_name FROM blocked_senders WHERE user_id=?",
+            (user_id,)).fetchall()
+    if not rows and not blocked:
+        return ""
+    lines = []
+    downs = [r for r in rows if r["thumbs"] == "down"]
+    ups   = [r for r in rows if r["thumbs"] == "up"]
+    if downs:
+        lines.append("Items the user marked NOT useful (avoid surfacing similar items):")
+        for r in downs[:10]:
+            label = r["title"] or ""
+            if r["contact_name"]: label += " (from " + r["contact_name"] + ")"
+            lines.append("- " + label)
+    if ups:
+        lines.append("Items the user found useful (prioritize similar items):")
+        for r in ups[:10]:
+            label = r["title"] or ""
+            if r["contact_name"]: label += " (from " + r["contact_name"] + ")"
+            lines.append("- " + label)
+    if blocked:
+        lines.append("NEVER surface items from these senders: " +
+                     ", ".join(r["contact_name"] for r in blocked))
+    try:
+        with _conn() as c:
+            missed = c.execute(
+                "SELECT title, notes FROM item_feedback WHERE user_id=? AND source='user_added' "
+                "ORDER BY created_at DESC LIMIT 10", (user_id,)).fetchall()
+        if missed:
+            lines.append("Items the user manually added (Hearth missed them — look for similar):")
+            for r in missed:
+                label = r["title"] or ""
+                if r["notes"]: label += " — context: " + r["notes"]
+                lines.append("- " + label)
+    except:
+        pass
+    return "\n".join(lines)
 
 # ── LLM intent ─────────────────────────────────────────────────────────────────
 

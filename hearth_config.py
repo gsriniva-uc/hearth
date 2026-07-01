@@ -24,6 +24,18 @@ if LANGSMITH_TRACING:
     os.environ["LANGCHAIN_API_KEY"]    = LANGSMITH_API_KEY
     os.environ["LANGCHAIN_PROJECT"]    = LANGSMITH_PROJECT
 
+# ── Google OAuth (shared by auth + gmail + gcal) ─────────────────────────────
+GOOGLE_CLIENT_ID     = os.getenv("GOOGLE_CLIENT_ID",
+    "289231572725-5fn10ulbb5hi6gqohnl1v6ourjsj01fu.apps.googleusercontent.com")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_SCOPES        = [
+    "openid", "profile", "email",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/cloud-platform",
+]
+
 # ── Gmail OAuth ───────────────────────────────────────────────────────────────
 DATA_DIR         = os.getenv("DATA_DIR", "data")
 GOOGLE_CREDS     = os.path.join(DATA_DIR, "google_credentials.json")

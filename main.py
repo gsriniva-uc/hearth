@@ -12,12 +12,21 @@ import httpx
 
 import hearth_config as cfg
 from agent.calendar_agent import (
-    init_db, _query_upcoming, _query_today,
+    init_db, _conn, _query_upcoming, _query_today,
     _insert_event, _delete_event, _event_exists,
+    _get_gcal_service, _gcal_event_exists, _write_to_gcal,
+    _get_feedback_summary,
 )
 from agent.profile_agent import init_profiles, get_all_profiles, upsert_profile, get_children
 from agent.briefing_agent import _build_briefing
 from agent.graph import run
+from agent.auth import (
+    save_email_token as _save_token,
+    load_email_token as _load_token,
+    list_connected_emails as _list_connected_emails,
+    get_fresh_credentials,
+)
+from agent.gmail_agent import scan_gmail_account as _scan_single_gmail
 from db_migrate import migrate
 
 
@@ -140,152 +149,8 @@ def health():
     return {"status": "ok", "version": "1.0.0"}
 
 
-# ── Token helpers ──────────────────────────────────────────────────────────────
-
-def _token_dir(user_id: str) -> str:
-    d = os.path.join(cfg.DATA_DIR, "tokens", user_id)
-    os.makedirs(d, exist_ok=True)
-    return d
-
-def _safe_email(email: str) -> str:
-    return email.replace(".", "_").replace("@", "_at_")
-
-def _save_token(user_id: str, email: str, token_data: dict):
-    safe = _safe_email(email)
-    path = os.path.join(_token_dir(user_id), "gmail_" + safe + ".json")
-    with open(path, "w") as f:
-        json.dump(token_data, f)
-
-def _load_token(user_id: str, email: str):
-    safe = _safe_email(email)
-    path = os.path.join(_token_dir(user_id), "gmail_" + safe + ".json")
-    if not os.path.exists(path):
-        return None
-    with open(path) as f:
-        return json.load(f)
-
-def _list_connected_emails(user_id: str):
-    d = _token_dir(user_id)
-    emails = []
-    for fname in os.listdir(d):
-        if fname.startswith("gmail_") and fname.endswith(".json"):
-            safe  = fname[6:-5]
-            email = safe.replace("_at_", "@", 1)
-            parts = email.split("@")
-            email = "@".join(p.replace("_", ".") for p in parts)
-            emails.append(email)
-    return emails
-
-def _get_fresh_token(user_id: str, email: str):
-    from google.oauth2.credentials import Credentials
-    from google.auth.transport.requests import Request
-    token_data = _load_token(user_id, email)
-    if not token_data:
-        return None
-    creds = Credentials(
-        token=token_data.get("access_token"),
-        refresh_token=token_data.get("refresh_token"),
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        scopes=GMAIL_SCOPES,
-    )
-    if not creds.valid:
-        if creds.refresh_token:
-            try:
-                creds.refresh(Request())
-                token_data["access_token"] = creds.token
-                _save_token(user_id, email, token_data)
-            except Exception as e:
-                print("[token refresh] " + str(e))
-                return None
-        else:
-            return None
-    return creds.token if creds.valid else None
-
-
-# ── Google Calendar helpers ────────────────────────────────────────────────────
-
-def _get_gcal_service(user_id: str, email: str):
-    from googleapiclient.discovery import build
-    from google.oauth2.credentials import Credentials
-    from google.auth.transport.requests import Request
-    token_data = _load_token(user_id, email)
-    if not token_data:
-        return None
-    creds = Credentials(
-        token=token_data.get("access_token"),
-        refresh_token=token_data.get("refresh_token"),
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        scopes=GMAIL_SCOPES,
-    )
-    if not creds.valid and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-            token_data["access_token"] = creds.token
-            _save_token(user_id, email, token_data)
-        except Exception as e:
-            print(f"[gcal] refresh failed for {email} user {user_id}: {e}")
-            if "invalid_grant" in str(e):
-                import os as _os
-                safe = email.replace(".", "_").replace("@", "_at_")
-                path = _os.path.join(_token_dir(user_id), "gmail_" + safe + ".json")
-                if _os.path.exists(path): _os.remove(path)
-                print(f"[gcal] deleted expired token for {email}")
-            return None
-    return build("calendar", "v3", credentials=creds)
-
-
-def _gcal_event_exists(service, summary: str, event_date: str) -> bool:
-    try:
-        day_start = event_date + "T00:00:00Z"
-        day_end   = event_date + "T23:59:59Z"
-        result    = service.events().list(
-            calendarId="primary",
-            timeMin=day_start, timeMax=day_end,
-            q=summary[:30], singleEvents=True
-        ).execute()
-        for ev in result.get("items", []):
-            if summary.lower()[:20] in ev.get("summary", "").lower():
-                return True
-    except:
-        pass
-    return False
-
-
-def _write_to_gcal(user_id: str, email: str, summary: str,
-                   event_date: str, event_time: str = None,
-                   description: str = None):
-    from datetime import datetime, timedelta
-    service = _get_gcal_service(user_id, email)
-    if not service:
-        return None
-    if _gcal_event_exists(service, summary, event_date):
-        print("[gcal] duplicate skipped: " + summary)
-        return "duplicate"
-    if event_time:
-        start_dt = event_date + "T" + event_time + ":00"
-        try:
-            dt  = datetime.fromisoformat(start_dt)
-            end = (dt + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:00")
-        except:
-            end = start_dt
-        start = {"dateTime": start_dt, "timeZone": "America/New_York"}
-        end_t = {"dateTime": end,      "timeZone": "America/New_York"}
-    else:
-        start = {"date": event_date}
-        end_t = {"date": event_date}
-    body = {"summary": summary, "start": start, "end": end_t}
-    if description:
-        body["description"] = description
-    try:
-        result = service.events().insert(calendarId="primary", body=body).execute()
-        return result.get("id")
-    except Exception as e:
-        print("[gcal write] " + str(e))
-        return None
+# ── Token / GCal helpers now live in agent/auth.py and agent/calendar_agent.py ─
+# Imported at the top of this file.
 
 
 def _sync_gcal_to_db(user_id: str, email: str) -> dict:
@@ -354,13 +219,6 @@ def _sync_gcal_to_db(user_id: str, email: str) -> dict:
             c.commit()
         new += 1
     return {"new": new, "skipped": skipped, "error": None}
-
-
-# ── DB helper for tasks/patterns ───────────────────────────────────────────────
-
-def _tasks_conn():
-    from agent.calendar_agent import _conn
-    return _conn()
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
@@ -510,327 +368,8 @@ def get_speech_token(user_id: str):
         return {"token": None, "error": str(e)}
 
 
-# ── Gmail scan ─────────────────────────────────────────────────────────────────
-
-KNOWN_FAMILY_DOMAINS = [
-    "seesaw.me", "classdojo.com", "remind.com", "parentsquare.com",
-    "campintouch.com", "campanion.com", "campdoc.com", "ultracamp.com",
-    "campminder.com", "mybrightwheel.com", "schoolmessenger.com",
-    "finalforms.com", "campbrain.com", "myschoolapp.com", "blackbaud.com",
-    "powerschool.com", "transact.com", "campnetwork.com",
-]
-
-def _is_family_platform_sender(from_addr: str, extra_keywords: list) -> bool:
-    f = from_addr.lower()
-    for d in KNOWN_FAMILY_DOMAINS:
-        if d in f:
-            return True
-    for kw in extra_keywords:
-        if kw and len(kw) > 3 and kw.lower() in f:
-            return True
-    return False
-
-
-def _scan_single_gmail(user_id: str, email: str) -> dict:
-    from googleapiclient.discovery import build
-    from datetime import date, timedelta
-    from google.oauth2.credentials import Credentials
-    from google.auth.transport.requests import Request
-
-    token_data = _load_token(user_id, email)
-    if not token_data:
-        return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": "Not authenticated"}
-
-    creds = Credentials(
-        token=token_data.get("access_token"),
-        refresh_token=token_data.get("refresh_token"),
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        scopes=["https://www.googleapis.com/auth/gmail.readonly"],
-    )
-    if not creds.valid and creds.refresh_token:
-        creds.refresh(Request())
-        token_data["access_token"] = creds.token
-        _save_token(user_id, email, token_data)
-
-    service = build("gmail", "v1", credentials=creds)
-    after   = (date.today() - timedelta(days=30)).strftime("%Y/%m/%d")
-    # Pass 1 — subject keyword match (safety net for well-known phrasing)
-    query1 = ("after:" + after + " (subject:(reminder OR newsletter OR RSVP OR "
-              "cheerleading OR performance OR appointment OR invoice OR payment OR "
-              "festival OR recital OR dismissal OR activity OR birthday OR show OR "
-              "concert OR \"no school\" OR gymnastics OR class OR trial OR "
-              "\"art show\" OR \"picture day\" OR \"early dismissal\" OR "
-              "\"field trip\" OR \"dress down\" OR \"spirit day\" OR "
-              "\"school closed\" OR \"half day\" OR \"parent teacher\" OR "
-              "\"summer camp\" OR \"camp registration\" OR \"camp enrollment\" OR "
-              "\"camp forms\" OR \"camp orientation\" OR camper OR Campanion OR "
-              "\"action required\" OR \"final reminder\" OR \"sign up\" OR "
-              "registration OR enrollment OR form OR forms))"
-    )
-    # Pass 2 — recent emails regardless of subject (for allowlist/triage)
-    query2 = "after:" + after
-
-    result1 = service.users().messages().list(userId="me", q=query1, maxResults=75).execute()
-    result2 = service.users().messages().list(userId="me", q=query2, maxResults=100).execute()
-
-    seen_ids = set()
-    all_msgs = []
-    for msg in result1.get("messages", []) + result2.get("messages", []):
-        if msg["id"] not in seen_ids:
-            seen_ids.add(msg["id"])
-            all_msgs.append(msg)
-
-    if not all_msgs:
-        return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
-
-    keyword_ids = {m["id"] for m in result1.get("messages", [])}
-
-    # Load blocked senders for this user
-    blocked_senders = []
-    try:
-        from agent.calendar_agent import _conn as _bs_conn
-        with _bs_conn() as c:
-            blocked_senders = [r["contact_name"] for r in c.execute(
-                "SELECT contact_name FROM blocked_senders WHERE user_id=?", (user_id,)).fetchall()]
-    except Exception:
-        pass
-
-    # Allowlist keywords from user's schools and camps
-    extra_keywords = []
-    try:
-        from agent.profile_agent import get_all_profiles
-        for p in get_all_profiles(user_id):
-            if p.get("school"):
-                extra_keywords += re.findall(r"[A-Za-z]{4,}", p["school"])
-    except Exception:
-        pass
-    try:
-        from agent.calendar_agent import _conn as _ck_conn
-        with _ck_conn() as c:
-            for r in c.execute(
-                "SELECT DISTINCT camp_name FROM camps WHERE user_id=?", (user_id,)).fetchall():
-                extra_keywords += re.findall(r"[A-Za-z]{4,}", r["camp_name"])
-    except Exception:
-        pass
-
-    # Lightweight metadata for all candidates
-    meta = []
-    for msg in all_msgs[:100]:
-        try:
-            full    = service.users().messages().get(
-                userId="me", id=msg["id"], format="metadata",
-                metadataHeaders=["Subject", "From", "Date"]).execute()
-            headers = full["payload"].get("headers", [])
-            subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
-            sender  = next((h["value"] for h in headers if h["name"] == "From"), "")
-            date_h  = next((h["value"] for h in headers if h["name"] == "Date"), "")
-            meta.append({"id": msg["id"], "subject": subject, "from": sender, "date": date_h})
-        except Exception:
-            continue
-
-    # Drop emails from blocked senders entirely
-    if blocked_senders:
-        meta = [m for m in meta if not any(b.lower() in m["from"].lower() for b in blocked_senders if b)]
-        keyword_ids &= {m["id"] for m in meta}
-
-    # Classify remaining (non-keyword) emails: allowlisted sender vs needs triage
-    allowlisted_ids   = set()
-    triage_candidates = []
-    for m in meta:
-        if m["id"] in keyword_ids:
-            continue
-        if _is_family_platform_sender(m["from"], extra_keywords):
-            allowlisted_ids.add(m["id"])
-        else:
-            triage_candidates.append(m)
-
-    # Cheap triage pass — ask Claude which remaining subjects look family-relevant
-    triage_ids = set()
-    if triage_candidates:
-        import anthropic as ant
-        lines = []
-        for i, m in enumerate(triage_candidates[:30]):
-            lines.append(str(i) + ". Subject: " + m["subject"] + " | From: " + m["from"])
-        triage_prompt = (
-            "Below are email subjects and senders. Return the indices of emails that "
-            "MIGHT be relevant to a family's logistics. Be generous — include anything about:\n"
-            "- School events, forms, sign-ups, orientation, field trips, no-school days\n"
-            "- Summer camps, day camps, sports camps, camp registration or confirmation\n"
-            "- Kids classes or lessons (skating, swimming, dance, gymnastics, coding, art, music, etc.)\n"
-            "- Sports practices, games, tournaments, tryouts\n"
-            "- Doctor, dentist, or therapy appointments\n"
-            "- Registration or enrollment confirmations for any kids activity\n"
-            "- Payment receipts for kids activities\n"
-            "- Bills or payments for the family\n"
-            "Ignore: investment/finance updates, marketing, ads, general news, job alerts, "
-            "subscriptions unrelated to kids.\n\n"
-            + "\n".join(lines) +
-            "\n\nReturn ONLY a JSON array of indices, e.g. [0,3,7]. If none, return []."
-        )
-        try:
-            client = ant.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
-            resp   = client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=200,
-                     messages=[{"role": "user", "content": triage_prompt}])
-            raw  = re.sub(r"^```json\s*", "", resp.content[0].text.strip())
-            raw  = re.sub(r"\s*```$", "", raw)
-            idxs = json.loads(raw)
-            for i in idxs:
-                if isinstance(i, int) and 0 <= i < len(triage_candidates):
-                    triage_ids.add(triage_candidates[i]["id"])
-        except Exception as e:
-            print("[gmail triage] " + str(e))
-
-    final_ids = keyword_ids | allowlisted_ids | triage_ids
-
-    def extract_body(payload):
-        data = payload.get("body", {}).get("data", "")
-        if data and "text" in payload.get("mimeType", ""):
-            try: return base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-            except Exception: return ""
-        for part in payload.get("parts", []):
-            t = extract_body(part)
-            if t: return t
-        return ""
-
-    emails_data = []
-    meta_by_id  = {m["id"]: m for m in meta}
-    for mid in final_ids:
-        m = meta_by_id.get(mid)
-        if not m:
-            continue
-        try:
-            full = service.users().messages().get(userId="me", id=mid, format="full").execute()
-            body = extract_body(full["payload"])
-            if body:
-                emails_data.append({"subject": m["subject"], "from": m["from"],
-                                     "body": body[:3000], "received": m["date"]})
-        except Exception:
-            continue
-
-    if not emails_data:
-        return {"new": 0, "skipped": 0, "emails_scanned": 0, "error": None}
-
-    print("[gmail extract] emails included: " + str([e["subject"][:60] for e in emails_data]))
-    print("[gmail extract] keyword_ids=" + str(len(keyword_ids)) +
-          " allowlisted=" + str(len(allowlisted_ids)) +
-          " triage=" + str(len(triage_ids)))
-
-    children_str = ", ".join(get_children(user_id)) or "the children"
-    today_str    = date.today().strftime("%A, %B %d, %Y")
-    today_iso    = date.today().isoformat()
-    digest       = "".join(
-        "--- " + e["subject"] + " (from: " + e.get("from","") + ", received: " +
-        e.get("received","") + ") ---\n" + e["body"] + "\n"
-        for e in emails_data)
-
-    feedback_summary = _get_feedback_summary(user_id)
-    feedback_block = ("\nUSER FEEDBACK HISTORY (avoid repeating past mistakes):\n" + feedback_summary + "\n") if feedback_summary else ""
-
-    import anthropic as ant
-    prompt = (
-        "Hearth assistant. Today: " + today_str + " (" + today_iso + "). Children: " + children_str + "." + feedback_block + "\n"
-        "Extract two kinds of items from these emails:\n"
-        "1. Dated calendar events (event_type required, must have a specific date)\n"
-        "2. Action items with no specific single date — sign-ups, forms to complete, "
-        "feedback requests, registration tasks (school_task)\n\n"
-        "Return a JSON array. Each item is one of:\n"
-        "{\"item_type\":\"event\",\"child_name\":\"...\",\"event_type\":\"...\","
-        "\"event_date\":\"YYYY-MM-DD\",\"event_time\":null,\"notes\":\"...\"}\n"
-        "{\"item_type\":\"school_task\",\"title\":\"short action title\","
-        "\"due_date\":\"YYYY-MM-DD or null\",\"org_name\":\"sender organization name\","
-        "\"child_name\":\"name or null\",\"notes\":\"...\","
-        "\"source_email\":\"exact subject line of the email this came from\","
-        "\"action_url\":\"https://... if a direct link to take action is in the email, else null\"}\n\n"
-        "Use school_fundraiser for: teacher gifts, PTA donations, book fairs, class "
-        "contributions, spirit wear, fundraising requests from school.\n"
-        "Use bill ONLY for: utility bills, credit cards, insurance invoices, "
-        "subscription renewals from companies — NOT school contribution requests.\n"
-        "Valid event_type: dress_down_day,early_dismissal,recital,field_trip,"
-        "picture_day,special_day,doctor_appointment,dentist_appointment,"
-        "sports_game,school_holiday,camp,class,practice,performance,"
-        "tournament,tryout,registration_confirmed,activity,school_fundraiser,other\n"
-        "Use camp for summer camps, day camps, sports camps.\n"
-        "Use class for recurring lessons/classes (skating, swimming, dance, coding, art, music, etc.).\n"
-        "Use registration_confirmed when an email confirms a child is enrolled/registered/paid for an activity — use the activity start date as event_date.\n"
-        "Do NOT use bill as an event_type — bills are handled separately.\n"
-        "Only create school_task for genuinely actionable items from schools, camps, "
-        "or family-related platforms — not for marketing, newsletters, or financial "
-        "statements unrelated to the kids.\n"
-        "Always preserve the sender's actual organization name in org_name (e.g. "
-        "'Inventure Academy', not 'your school').\n"
-        "Emails:\n" + digest[:30000] + "\nONLY JSON array."
-    )
-
-    client = ant.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
-    resp   = client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=4096,
-             messages=[{"role": "user", "content": prompt}])
-    raw    = re.sub(r"^```json\s*", "", resp.content[0].text.strip())
-    raw    = re.sub(r"\s*```$", "", raw)
-    print("[gmail extract raw] " + raw[:2000])
-    try:    items = json.loads(raw)
-    except Exception:
-        items = []
-        print("[gmail extract] JSON parse failed.")
-    print("[gmail extract] " + str(len(emails_data)) + " emails sent, " + str(len(items)) + " items returned")
-
-    new = skipped = 0
-    for item in items:
-        item_type = item.get("item_type", "event")
-
-        if item_type == "school_task":
-            title = (item.get("title") or "").strip()
-            if not title:
-                continue
-            with _tasks_conn() as c:
-                existing = c.execute(
-                    "SELECT id FROM tasks WHERE user_id=? AND task_type='school_task' "
-                    "AND title=?", (user_id, title)).fetchone()
-                if existing:
-                    skipped += 1
-                    continue
-                notes_parts = []
-                if item.get("notes"):      notes_parts.append(item["notes"])
-                if item.get("source_email"): notes_parts.append("From email: " + item["source_email"])
-                notes_val = " | ".join(notes_parts) or None
-                c.execute(
-                    "INSERT INTO tasks(user_id,task_type,title,status,due_date,"
-                    "contact_name,child_name,notes,payment_url) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (user_id, "school_task", title, "pending",
-                     item.get("due_date"), item.get("org_name"), item.get("child_name"),
-                     notes_val, item.get("action_url")))
-                c.commit()
-            new += 1
-            continue
-
-        child = item.get("child_name") or "all"
-        etype = item.get("event_type") or "other"
-        edate = item.get("event_date", "")
-        if not edate: continue
-        if _event_exists(user_id, child, etype, edate): skipped += 1; continue
-        event_id = _insert_event(user_id, child, etype, edate, item.get("event_time"), item.get("notes"))
-        try:
-            gcal_summary = item.get("notes") or etype.replace("_", " ").title()
-            if child and child != "all":
-                gcal_summary = child + " - " + gcal_summary
-            emails_list = _list_connected_emails(user_id)
-            if emails_list:
-                svc = _get_gcal_service(user_id, emails_list[0])
-                if svc and not _gcal_event_exists(svc, gcal_summary, edate):
-                    gcal_id = _write_to_gcal(user_id, emails_list[0], gcal_summary,
-                                             edate, item.get("event_time"), item.get("notes"))
-                    if gcal_id and gcal_id != "duplicate":
-                        from agent.calendar_agent import _conn
-                        with _conn() as c:
-                            c.execute("UPDATE events SET gcal_event_id=? WHERE id=?",
-                                      (gcal_id, event_id))
-                            c.commit()
-        except Exception as e:
-            print("[gcal scan write] " + str(e))
-        new += 1
-
-    return {"new": new, "skipped": skipped, "emails_scanned": len(emails_data), "error": None}
+# ── Gmail scan — logic lives in agent/gmail_agent.py ──────────────────────────
+# _scan_single_gmail is imported as scan_gmail_account at the top of this file.
 
 
 # ── Actions — Sent mail scanner, bill scanner, pattern evaluator ───────────────
@@ -934,7 +473,7 @@ def _scan_sent_mail(user_id: str, email: str, days_back: int = 90) -> dict:
             if not ptype:
                 continue
 
-            with _tasks_conn() as c:
+            with _conn() as c:
                 existing = c.execute(
                     "SELECT id, confidence_score FROM patterns "
                     "WHERE user_id=? AND pattern_type=? AND contact_email=?",
@@ -1046,7 +585,7 @@ def _scan_bill_emails(user_id: str, email: str, days_back: int = 30) -> dict:
             if not data.get("due_date"):
                 continue
 
-            with _tasks_conn() as c:
+            with _conn() as c:
                 existing = c.execute(
                     "SELECT id FROM tasks WHERE user_id=? AND task_type='bill' "
                     "AND contact_name=? AND due_date=?",
@@ -1077,7 +616,7 @@ def _scan_bill_emails(user_id: str, email: str, days_back: int = 30) -> dict:
 def _evaluate_patterns(user_id: str) -> dict:
     from datetime import date, timedelta
 
-    with _tasks_conn() as c:
+    with _conn() as c:
         patterns = c.execute(
             "SELECT * FROM patterns WHERE user_id=? AND confidence_score >= 0.5",
             (user_id,)).fetchall()
@@ -1092,7 +631,7 @@ def _evaluate_patterns(user_id: str) -> dict:
         if p["next_due_date"] > today:
             continue
 
-        with _tasks_conn() as c:
+        with _conn() as c:
             existing = c.execute(
                 "SELECT id FROM tasks WHERE user_id=? AND contact_email=? "
                 "AND task_type=? AND status='pending'",
@@ -1129,7 +668,7 @@ def _evaluate_patterns(user_id: str) -> dict:
             continue
 
         next_due = (date.today() + timedelta(days=p["frequency_days"])).isoformat()
-        with _tasks_conn() as c:
+        with _conn() as c:
             c.execute(
                 "INSERT INTO tasks(user_id,task_type,title,status,due_date,"
                 "draft_to,draft_subject,draft_body,contact_name,contact_email,"
@@ -1290,7 +829,7 @@ def delete_event(event_id: int, user_id: str):
 def _get_tasks(user_id: str, status: str = "pending") -> list:
     from datetime import datetime
     now = datetime.now().isoformat()
-    with _tasks_conn() as c:
+    with _conn() as c:
         if status == "pending":
             rows = c.execute(
                 "SELECT * FROM tasks WHERE user_id=? "
@@ -1326,7 +865,7 @@ class TaskCreateRequest(BaseModel):
 
 @app.post("/tasks")
 def create_task(req: TaskCreateRequest):
-    with _tasks_conn() as c:
+    with _conn() as c:
         c.execute("""
             INSERT INTO tasks(user_id,task_type,title,status,due_date,
             amount,payment_url,company_login_url,contact_name,contact_email,
@@ -1363,7 +902,7 @@ def scan_actions(user_id: str):
 
 @app.post("/tasks/{task_id}/send")
 def send_task(task_id: int, user_id: str):
-    with _tasks_conn() as c:
+    with _conn() as c:
         task = c.execute(
             "SELECT * FROM tasks WHERE id=? AND user_id=?",
             (task_id, user_id)).fetchone()
@@ -1376,7 +915,7 @@ def send_task(task_id: int, user_id: str):
     ok = _send_draft_email(user_id, emails[0],
                            task["draft_to"], task["draft_subject"], task["draft_body"])
     if ok:
-        with _tasks_conn() as c:
+        with _conn() as c:
             c.execute("UPDATE tasks SET status='sent', last_triggered=datetime('now') WHERE id=?",
                       (task_id,))
             c.commit()
@@ -1388,7 +927,7 @@ def send_task(task_id: int, user_id: str):
 def snooze_task(task_id: int, user_id: str, days: int = 3):
     from datetime import datetime, timedelta
     snooze_until = (datetime.now() + timedelta(days=days)).isoformat()
-    with _tasks_conn() as c:
+    with _conn() as c:
         c.execute("UPDATE tasks SET status='snoozed', snoozed_until=? WHERE id=? AND user_id=?",
                   (snooze_until, task_id, user_id))
         c.commit()
@@ -1397,7 +936,7 @@ def snooze_task(task_id: int, user_id: str, days: int = 3):
 
 @app.post("/tasks/{task_id}/done")
 def done_task(task_id: int, user_id: str):
-    with _tasks_conn() as c:
+    with _conn() as c:
         c.execute("UPDATE tasks SET status='done' WHERE id=? AND user_id=?",
                   (task_id, user_id))
         c.commit()
@@ -1408,7 +947,7 @@ def done_task(task_id: int, user_id: str):
 def thumbs_task(task_id: int, user_id: str, value: str):
     if value not in ("up", "down"):
         raise HTTPException(400, "value must be up or down")
-    with _tasks_conn() as c:
+    with _conn() as c:
         c.execute("UPDATE tasks SET thumbs=? WHERE id=? AND user_id=?",
                   (value, task_id, user_id))
         if value == "up":
@@ -1420,7 +959,7 @@ def thumbs_task(task_id: int, user_id: str, value: str):
 
 @app.put("/tasks/{task_id}/draft")
 def update_draft(task_id: int, user_id: str, req: dict):
-    with _tasks_conn() as c:
+    with _conn() as c:
         c.execute("UPDATE tasks SET draft_body=?, draft_subject=?, draft_to=? WHERE id=? AND user_id=?",
                   (req.get("body"), req.get("subject"), req.get("to"), task_id, user_id))
         c.commit()
@@ -1429,7 +968,7 @@ def update_draft(task_id: int, user_id: str, req: dict):
 
 @app.get("/patterns")
 def get_patterns(user_id: str):
-    with _tasks_conn() as c:
+    with _conn() as c:
         rows = c.execute(
             "SELECT * FROM patterns WHERE user_id=? ORDER BY next_due_date",
             (user_id,)).fetchall()
@@ -1438,7 +977,7 @@ def get_patterns(user_id: str):
 
 @app.delete("/patterns/{pattern_id}")
 def delete_pattern(pattern_id: int, user_id: str):
-    with _tasks_conn() as c:
+    with _conn() as c:
         c.execute("DELETE FROM patterns WHERE id=? AND user_id=?",
                   (pattern_id, user_id))
         c.commit()
@@ -1894,7 +1433,7 @@ async def create_manual_pattern(request: Request):
     keywords     = body.get("keywords", "")
     next_due     = date.today().isoformat()  # due immediately
 
-    with _tasks_conn() as c:
+    with _conn() as c:
         c.execute(
             "INSERT INTO patterns(user_id,pattern_type,contact_email,"
             "contact_name,keywords,frequency_days,last_action_date,"
@@ -3490,60 +3029,6 @@ async def submit_feedback(request: Request):
 
     return {"status": "ok"}
 
-
-def _get_feedback_summary(user_id: str) -> str:
-    """Build a short feedback history block for prompt injection."""
-    from agent.calendar_agent import _conn
-    with _conn() as c:
-        rows = c.execute(
-            "SELECT item_type, title, contact_name, thumbs FROM item_feedback "
-            "WHERE user_id=? ORDER BY created_at DESC LIMIT 20",
-            (user_id,)).fetchall()
-        blocked = c.execute(
-            "SELECT contact_name FROM blocked_senders WHERE user_id=?",
-            (user_id,)).fetchall()
-
-    if not rows and not blocked:
-        return ""
-
-    lines = []
-    downs = [r for r in rows if r["thumbs"] == "down"]
-    ups   = [r for r in rows if r["thumbs"] == "up"]
-
-    if downs:
-        lines.append("Items the user marked NOT useful (avoid surfacing similar items):")
-        for r in downs[:10]:
-            label = r["title"] or ""
-            if r["contact_name"]:
-                label += " (from " + r["contact_name"] + ")"
-            lines.append("- " + label)
-
-    if ups:
-        lines.append("Items the user found useful (prioritize similar items):")
-        for r in ups[:10]:
-            label = r["title"] or ""
-            if r["contact_name"]:
-                label += " (from " + r["contact_name"] + ")"
-            lines.append("- " + label)
-
-    if blocked:
-        names = ", ".join(r["contact_name"] for r in blocked)
-        lines.append("NEVER surface items from these senders: " + names)
-
-    with _conn() as c:
-        missed = c.execute(
-            "SELECT title, notes FROM item_feedback WHERE user_id=? AND source='user_added' "
-            "ORDER BY created_at DESC LIMIT 10", (user_id,)).fetchall()
-    if missed:
-        lines.append("Items the user manually added because Hearth missed them "
-                      "(these show what this family cares about - look for similar things):")
-        for r in missed:
-            label = r["title"] or ""
-            if r["notes"]:
-                label += " — context: " + r["notes"]
-            lines.append("- " + label)
-
-    return "\n".join(lines)
 
 
 
