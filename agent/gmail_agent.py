@@ -17,18 +17,20 @@ from googleapiclient.discovery import build
 import hearth_config as cfg
 from agent.auth import get_credentials, token_path
 
-EVENT_TYPES = ["dress_down_day","early_dismissal","recital","movie_night","field_trip",
-               "special_day","doctor_appointment","sports_game","school_holiday","other"]
-
-SCHOOL_QUERY = (
-    "(subject:(dismissal OR recital OR \"dress down\" OR \"field trip\" OR "
-    "\"picture day\" OR \"spirit day\" OR newsletter OR \"school event\" OR "
-    "\"early release\" OR \"school holiday\" OR \"no school\" OR \"day off\" OR "
-    "\"schools closed\" OR \"holiday break\" OR \"parent teacher\" OR "
-    "\"upcoming events\" OR performance OR fundraiser OR reminder) "
-    "OR (\"no school\" OR \"school holiday\" OR \"early dismissal\" OR \"dress down\" "
-    "OR \"field trip\" OR \"early release\" OR \"schools closed\"))"
-)
+EVENT_TYPES = [
+    # School
+    "dress_down_day", "early_dismissal", "field_trip", "picture_day",
+    "school_holiday", "school_event", "parent_teacher_conference",
+    # Activities & classes
+    "camp", "class", "practice", "recital", "performance", "sports_game",
+    "tournament", "tryout",
+    # Health
+    "doctor_appointment", "dentist_appointment", "therapy_appointment",
+    # Registrations & payments
+    "registration_confirmed", "payment_confirmed", "registration_deadline",
+    # Misc
+    "movie_night", "special_day", "other",
+]
 
 def is_credentials_configured(): return os.path.exists(cfg.GOOGLE_CREDS)
 def is_authenticated(user_id: str) -> bool: return get_credentials(user_id) is not None
@@ -71,11 +73,18 @@ def _fetch_batch(service, message_refs: list) -> list:
             continue
     return emails
 
-# ── Prong 1: keyword search ────────────────────────────────────────────────────
+# ── Prong 1: keyword search (broad — any child activity language) ──────────────
 
-def _fetch_by_keyword(service, after: str, max_results=50) -> list:
+ACTIVITY_QUERY = (
+    "subject:(camp OR class OR practice OR registration OR confirmed OR "
+    "\"sign up\" OR enrolled OR schedule OR recital OR performance OR "
+    "tournament OR tryout OR appointment OR dismissal OR \"field trip\" OR "
+    "newsletter OR \"no school\" OR \"early release\" OR \"school holiday\")"
+)
+
+def _fetch_by_keyword(service, after: str, max_results=75) -> list:
     result = service.users().messages().list(
-        userId="me", q=f"{SCHOOL_QUERY} after:{after}", maxResults=max_results
+        userId="me", q=f"{ACTIVITY_QUERY} after:{after}", maxResults=max_results
     ).execute()
     return _fetch_batch(service, result.get("messages", []))
 
@@ -103,7 +112,7 @@ def _fetch_by_sender(service, after: str, school_names: list, max_results=50) ->
 
 # ── Prong 3: full inbox scan ───────────────────────────────────────────────────
 
-def _fetch_all_inbox(service, after: str, max_results=100) -> list:
+def _fetch_all_inbox(service, after: str, max_results=200) -> list:
     result = service.users().messages().list(
         userId="me", q=f"after:{after}", maxResults=max_results
     ).execute()
@@ -122,7 +131,7 @@ def _merge_emails(*email_lists) -> list:
                 merged.append(email)
     return merged
 
-def _fetch_emails(user_id: str, days_back=14) -> list:
+def _fetch_emails(user_id: str, days_back=30) -> list:
     service = _get_service(user_id)
     after   = (date.today() - timedelta(days=days_back)).strftime("%Y/%m/%d")
 
@@ -136,15 +145,38 @@ def _extract_events(emails, children):
     if not emails: return []
     today_str    = date.today().strftime("%A, %B %d, %Y")
     children_str = ", ".join(children) or "the children"
-    digest = "".join(f"\n--- {e['subject']} ---\n{e['body']}\n" for e in emails)
-    prompt = f"""Hearth assistant. Today: {today_str}. Children: {children_str}.
-Valid event_type: {", ".join(EVENT_TYPES)}.
-{len(emails)} emails (school, family, and general inbox):
+    digest = "".join(f"\n--- FROM: {e['sender']} | SUBJECT: {e['subject']} ---\n{e['body']}\n" for e in emails)
+    prompt = f"""You are Hearth, a family calendar assistant. Today: {today_str}. Children: {children_str}.
+
+Your job is to extract ANYTHING from these emails that belongs on a family calendar or represents a commitment made for the children. Think broadly — not just school events but ALL kids activities.
+
+Extract:
+- School events (no school days, early dismissals, field trips, picture day, etc.)
+- Classes and lessons (skating, swimming, dance, coding, art, music, etc.)
+- Camps (summer camps, day camps, sports camps — including confirmation/registration emails)
+- Sports (practices, games, tournaments, tryouts)
+- Appointments (doctor, dentist, therapy)
+- Performances and recitals
+- Registration confirmations and payment receipts — these mean the child IS enrolled, extract the activity start date or session dates
+- Deadlines (registration deadlines, form submission deadlines)
+
+Valid event_type values: {", ".join(EVENT_TYPES)}
+
+Use registration_confirmed when an email confirms a child is registered/enrolled/paid for something.
+Use payment_confirmed when a payment receipt is found — extract what it was for and when the activity starts.
+
+{len(emails)} emails:
 {digest}
-Extract upcoming events (today or later) relevant to the children listed. Pay attention to no-school days, closures, early dismissals, appointments, and activities.
-Return JSON array: [{{"child_name":"...","event_type":"...","event_date":"YYYY-MM-DD","event_time":"HH:MM|null","notes":"...|null","source_email":"..."}}]
-If an event applies to all children use child_name "all".
-ONLY JSON array."""
+
+Return a JSON array of all events found. For each event:
+- child_name: name of the child it applies to, or "all" if all children
+- event_type: one of the valid types above
+- event_date: YYYY-MM-DD (use activity start date for registrations; skip if truly no date found)
+- event_time: HH:MM or null
+- notes: brief description including activity name, location, or amount paid if relevant
+- source_email: the email subject
+
+Only include events with a date. ONLY return a JSON array, no other text."""
     client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
     resp   = client.messages.create(model=cfg.CLAUDE_MODEL, max_tokens=2048,
         messages=[{"role":"user","content":prompt}])
@@ -154,7 +186,7 @@ ONLY JSON array."""
         evs = json.loads(raw); return evs if isinstance(evs,list) else []
     except: return []
 
-def auto_scan_and_save(user_id: str, children: list, days_back=14) -> dict:
+def auto_scan_and_save(user_id: str, children: list, days_back=30) -> dict:
     """Scan Gmail for this user and save new events (deduped) to their event store."""
     from agent.calendar_agent import _insert_event, _event_exists, _sync_to_gcal, _sync_to_outlook
     try:
