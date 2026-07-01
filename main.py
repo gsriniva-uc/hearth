@@ -572,8 +572,8 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
     # Pass 2 — recent emails regardless of subject (for allowlist/triage)
     query2 = "after:" + after
 
-    result1 = service.users().messages().list(userId="me", q=query1, maxResults=30).execute()
-    result2 = service.users().messages().list(userId="me", q=query2, maxResults=40).execute()
+    result1 = service.users().messages().list(userId="me", q=query1, maxResults=75).execute()
+    result2 = service.users().messages().list(userId="me", q=query2, maxResults=100).execute()
 
     seen_ids = set()
     all_msgs = []
@@ -617,7 +617,7 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
 
     # Lightweight metadata for all candidates
     meta = []
-    for msg in all_msgs[:45]:
+    for msg in all_msgs[:100]:
         try:
             full    = service.users().messages().get(
                 userId="me", id=msg["id"], format="metadata",
@@ -655,11 +655,17 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
             lines.append(str(i) + ". Subject: " + m["subject"] + " | From: " + m["from"])
         triage_prompt = (
             "Below are email subjects and senders. Return the indices of emails that "
-            "MIGHT be relevant to a family's logistics: school events, forms, sign-ups, "
-            "orientation, summer camps, bills or payments for the family, medical or "
-            "doctor appointments, kids activities. Ignore newsletters, investment or "
-            "finance updates, marketing, ads, general news, job alerts, and "
-            "subscriptions unrelated to the family.\n\n"
+            "MIGHT be relevant to a family's logistics. Be generous — include anything about:\n"
+            "- School events, forms, sign-ups, orientation, field trips, no-school days\n"
+            "- Summer camps, day camps, sports camps, camp registration or confirmation\n"
+            "- Kids classes or lessons (skating, swimming, dance, gymnastics, coding, art, music, etc.)\n"
+            "- Sports practices, games, tournaments, tryouts\n"
+            "- Doctor, dentist, or therapy appointments\n"
+            "- Registration or enrollment confirmations for any kids activity\n"
+            "- Payment receipts for kids activities\n"
+            "- Bills or payments for the family\n"
+            "Ignore: investment/finance updates, marketing, ads, general news, job alerts, "
+            "subscriptions unrelated to kids.\n\n"
             + "\n".join(lines) +
             "\n\nReturn ONLY a JSON array of indices, e.g. [0,3,7]. If none, return []."
         )
@@ -699,7 +705,7 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
             body = extract_body(full["payload"])
             if body:
                 emails_data.append({"subject": m["subject"], "from": m["from"],
-                                     "body": body[:1200], "received": m["date"]})
+                                     "body": body[:3000], "received": m["date"]})
         except Exception:
             continue
 
@@ -742,8 +748,12 @@ def _scan_single_gmail(user_id: str, email: str) -> dict:
         "Use bill ONLY for: utility bills, credit cards, insurance invoices, "
         "subscription renewals from companies — NOT school contribution requests.\n"
         "Valid event_type: dress_down_day,early_dismissal,recital,field_trip,"
-        "special_day,doctor_appointment,sports_game,school_holiday,activity,"
-        "school_fundraiser,other\n"
+        "picture_day,special_day,doctor_appointment,dentist_appointment,"
+        "sports_game,school_holiday,camp,class,practice,performance,"
+        "tournament,tryout,registration_confirmed,activity,school_fundraiser,other\n"
+        "Use camp for summer camps, day camps, sports camps.\n"
+        "Use class for recurring lessons/classes (skating, swimming, dance, coding, art, music, etc.).\n"
+        "Use registration_confirmed when an email confirms a child is enrolled/registered/paid for an activity — use the activity start date as event_date.\n"
         "Do NOT use bill as an event_type — bills are handled separately.\n"
         "Only create school_task for genuinely actionable items from schools, camps, "
         "or family-related platforms — not for marketing, newsletters, or financial "
