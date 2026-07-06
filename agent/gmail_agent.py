@@ -211,30 +211,31 @@ def scan_gmail_account(user_id: str, email: str, days_back: int = 90) -> dict:
         else:
             triage_candidates.append(m)
 
-    # Claude triage — cheap subject-only pass, processed in batches so nothing is dropped
-    triage_ids = set()
+    # Triage: exclusion filter — drop only obvious non-family emails, keep everything else.
+    # Asking "what to drop" is safer than "what to keep" because missing an event
+    # requires two independent failures (scan miss + triage miss).
+    excluded_ids = set()
     TRIAGE_BATCH = 80
     for batch_start in range(0, len(triage_candidates), TRIAGE_BATCH):
         batch = triage_candidates[batch_start:batch_start + TRIAGE_BATCH]
         lines = [f"{i}. Subject: {m['subject']} | From: {m['from']}"
                  for i, m in enumerate(batch)]
         triage_prompt = (
-            "Below are email subjects and senders. Return the indices of emails that "
-            "MIGHT be relevant to a family's logistics. Be generous — when in doubt, include it.\n"
-            "Include anything about:\n"
-            "- School events, forms, sign-ups, orientation, field trips, no-school days\n"
-            "- Summer camps, day camps, sports camps, camp registration or confirmation\n"
-            "- Kids classes or lessons (skating, swimming, dance, gymnastics, coding, art, music, etc.)\n"
-            "- Club activities, sports leagues, teams\n"
-            "- Sports practices, games, tournaments, tryouts\n"
-            "- Doctor, dentist, or therapy appointments\n"
-            "- Registration, enrollment, or payment confirmations for any kids activity\n"
-            "- Welcome emails or orientation from any kids program\n"
-            "- Bills or payments for the family\n"
-            "Exclude only: investment/brokerage updates, marketing from stores, general news, "
-            "job alerts, social media notifications.\n\n"
+            "Below are email subjects and senders from a family's inbox.\n"
+            "Return the indices of emails that are DEFINITELY NOT relevant to family logistics — "
+            "i.e. emails you are certain contain no events, appointments, activities, or action items "
+            "for the family or children.\n\n"
+            "Exclude ONLY if clearly one of:\n"
+            "- Investment/brokerage/stock account statements or alerts\n"
+            "- Retail store promotions, coupons, or sale announcements\n"
+            "- Social media notifications (likes, follows, comments)\n"
+            "- General news digests or political newsletters\n"
+            "- Job listing or recruiter emails\n"
+            "- Travel loyalty points / airline miles updates with no trip booked\n\n"
+            "When in doubt, do NOT exclude — it is better to include an irrelevant email "
+            "than to miss a child's activity.\n\n"
             + "\n".join(lines) +
-            "\n\nReturn ONLY a JSON array of indices, e.g. [0,3,7]. If none, return []."
+            "\n\nReturn ONLY a JSON array of indices to EXCLUDE, e.g. [2,5]. If none, return []."
         )
         try:
             client = anthropic.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
@@ -245,11 +246,13 @@ def scan_gmail_account(user_id: str, email: str, days_back: int = 90) -> dict:
             idxs = json.loads(raw)
             for i in idxs:
                 if isinstance(i, int) and 0 <= i < len(batch):
-                    triage_ids.add(batch[i]["id"])
+                    excluded_ids.add(batch[i]["id"])
         except Exception as e:
             print(f"[gmail triage] {e}")
 
-    final_ids = keyword_ids | allowlisted_ids | triage_ids
+    # Everything not excluded passes through
+    triage_ids = {m["id"] for m in triage_candidates} - excluded_ids
+    final_ids  = keyword_ids | allowlisted_ids | triage_ids
 
     # Fetch full bodies for final set
     meta_by_id  = {m["id"]: m for m in meta}
