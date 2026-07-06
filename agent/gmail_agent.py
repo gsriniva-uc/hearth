@@ -91,6 +91,36 @@ def _extract_body(payload) -> str:
             return t
     return ""
 
+def _extract_pdf_attachment(service, message_id: str, attachment_id: str) -> str:
+    """Download a Gmail attachment and extract text from it if it's a PDF."""
+    try:
+        att = service.users().messages().attachments().get(
+            userId="me", messageId=message_id, id=attachment_id
+        ).execute()
+        data = base64.urlsafe_b64decode(att["data"])
+        import io
+        from PyPDF2 import PdfReader
+        reader = PdfReader(io.BytesIO(data))
+        pages = [page.extract_text() or "" for page in reader.pages[:5]]
+        return "\n".join(pages).strip()
+    except Exception as e:
+        print(f"[gmail pdf] {e}")
+        return ""
+
+def _collect_attachments(service, message_id: str, payload) -> str:
+    """Walk the MIME tree and extract text from any PDF attachments."""
+    texts = []
+    filename = payload.get("filename", "")
+    mime = payload.get("mimeType", "")
+    att_id = payload.get("body", {}).get("attachmentId")
+    if att_id and (mime == "application/pdf" or filename.lower().endswith(".pdf")):
+        text = _extract_pdf_attachment(service, message_id, att_id)
+        if text:
+            texts.append(f"[Attachment: {filename}]\n{text}")
+    for part in payload.get("parts", []):
+        texts.append(_collect_attachments(service, message_id, part))
+    return "\n".join(t for t in texts if t)
+
 def _is_family_platform_sender(from_addr: str, extra_keywords: list) -> bool:
     f = from_addr.lower()
     for d in KNOWN_FAMILY_DOMAINS:
@@ -254,7 +284,7 @@ def scan_gmail_account(user_id: str, email: str, days_back: int = 90) -> dict:
     triage_ids = {m["id"] for m in triage_candidates} - excluded_ids
     final_ids  = keyword_ids | allowlisted_ids | triage_ids
 
-    # Fetch full bodies for final set
+    # Fetch full bodies (+ PDF attachments) for final set
     meta_by_id  = {m["id"]: m for m in meta}
     emails_data = []
     for mid in final_ids:
@@ -262,13 +292,15 @@ def scan_gmail_account(user_id: str, email: str, days_back: int = 90) -> dict:
         if not m:
             continue
         try:
-            full = service.users().messages().get(userId="me", id=mid, format="full").execute()
-            body = _extract_body(full["payload"])
-            if body:
+            full    = service.users().messages().get(userId="me", id=mid, format="full").execute()
+            body    = _extract_body(full["payload"])
+            att_txt = _collect_attachments(service, mid, full["payload"])
+            combined = "\n\n".join(t for t in [body, att_txt] if t)
+            if combined:
                 emails_data.append({
                     "subject":  m["subject"],
                     "from":     m["from"],
-                    "body":     body[:3000],
+                    "body":     combined[:5000],
                     "received": m["date"],
                 })
         except:
